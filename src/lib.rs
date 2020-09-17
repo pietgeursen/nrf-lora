@@ -2,9 +2,15 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+// pick a panicking behavior
+//use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics
+//use panic_abort as _; // requires nightly
+// use panic_itm as _; // logs messages over ITM; requires ITM support
+//use panic_semihosting as _; // logs messages to the host stderr; requires a debugger
+
 use defmt_rtt as _; // global logger
-use panic_probe as _;
 use nrf52832_hal as _;
+use panic_probe as _;
 
 #[defmt::timestamp]
 fn timestamp() -> u64 {
