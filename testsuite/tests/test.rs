@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-use bamboo_core::*;
+use bamboo_rs_core::*;
 use cortex_m_rt::entry;
 use nrf_bamboo_rs as _;
 
-use nrf52832_hal::{
+use nrf52840_hal::{
     pac::{Peripherals, TEMP},
     Temp,
 };
@@ -41,7 +41,7 @@ fn verify_valid_entry() {
 
     let size = publish(
         &mut out,
-        Some(&key_pair),
+        &key_pair,
         0,
         payload.as_bytes(),
         false,
@@ -51,10 +51,11 @@ fn verify_valid_entry() {
     )
     .unwrap();
 
-    let mut entry = decode(&out[..size]).unwrap();
+    let entry = decode(&out[..size]).unwrap();
 
-    assert!(entry.verify_signature().unwrap());
+    assert!(entry.verify_signature().is_ok());
 }
+
 fn verify_invalid_entry() {
     defmt::info!("testing verify invalid entry...");
     let secret_key_bytes = [
@@ -76,7 +77,7 @@ fn verify_invalid_entry() {
 
     let size = publish(
         &mut out,
-        Some(&key_pair),
+        &key_pair,
         0,
         payload.as_bytes(),
         false,
@@ -87,7 +88,7 @@ fn verify_invalid_entry() {
     .unwrap();
 
     out[30] = !out[30];
-    let mut entry = decode(&out[..size]).unwrap();
+    let entry = decode(&out[..size]).unwrap();
 
     assert!(entry.verify_signature().is_err());
 }
@@ -102,5 +103,6 @@ fn main() -> ! {
     verify_valid_entry();
     verify_invalid_entry();
 
+    defmt::info!("Tests OK");
     nrf_bamboo_rs::exit();
 }

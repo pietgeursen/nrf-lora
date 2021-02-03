@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 //use panic_semihosting as _; // logs messages to the host stderr; requires a debugger
 
 use defmt_rtt as _; // global logger
-use nrf52832_hal as _;
+use nrf52840_hal as _;
 use panic_probe as _;
 
 #[defmt::timestamp]

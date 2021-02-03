@@ -9,11 +9,14 @@ version = "0.1.0"
 members = ["testsuite"]
 
 [dependencies]
-cortex-m = "0.6.3"
-cortex-m-rt = "0.6.12"
+apds9960 = "0.1.0"
+bamboo-rs-core = { path = "../choir/bamboo-rs/bamboo-rs-core", default-features=false }
+bmp280 = { path = "../bmp280" }
+cortex-m = "0.7.1"
+cortex-m-rt = "0.6.13"
+nrf52840-hal = "0.12.0"
+nrf-softdevice-s132 = "0.1.1"
 panic-halt = "0.2.0"
-bamboo-core = { path = "../choir/bamboo-rs/bamboo-core", default-features=false }
-nrf52832-hal = "0.11.0"
 
 [dependencies.defmt]
 git = "https://github.com/knurling-rs/defmt"
