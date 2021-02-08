@@ -3,7 +3,7 @@ target remote :3333
 # print demangled symbols by default
 set print asm-demangle on
 
-#monitor semihosting enable
+# monitor semihosting enable
 
 # # send captured ITM to the file itm.fifo
 # # (the microcontroller SWO pin must be connected to the programmer SWO pin)
@@ -16,9 +16,7 @@ set print asm-demangle on
 
 # # enable ITM port 0
 # monitor itm port 0 on
-# mon swo start 0 10000000
+# mon swo start 0 64000000
 
 load
-mon reset
-break main
-c
+step
