@@ -4,9 +4,11 @@
 use nrf52840_hal::gpio::p0::Parts;
 use nrf52840_hal::pac::twim0::frequency::FREQUENCY_A;
 use nrf52840_hal::pac::P1;
-use nrf52840_hal::pac::{DWT, TWIM0};
+use nrf52840_hal::pac::{DWT, TWIM0, SPIM0};
 use nrf52840_hal::twim::Pins as TwimPins;
-use nrf52840_hal::Twim;
+use nrf52840_hal::spim::{Pins as SpimPins, Mode as SpimMode, Polarity, Phase, Frequency as SpimFrequency};
+use nrf52840_hal::{Twim, Spim};
+use nrf52840_hal::gpio::Level;
 use nrf_bamboo_rs as _;
 use nrf_softdevice_s140::*;
 use rtic::app;
@@ -22,39 +24,77 @@ const PERIOD: u32 = 64_000_000;
 #[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
-        twim: Twim<TWIM0>,
-        bmp280: BMP280<Twim<TWIM0>, ModeNormal>,
+        //twim: Twim<TWIM0>,
+        spim: Spim<SPIM0>,
+        //bmp280: BMP280<Twim<TWIM0>, ModeNormal>,
         port_one: P1,
     }
 
     #[init(schedule = [measure_bmp_pressure])]
     fn init(ctx: init::Context) -> init::LateResources {
         // Cortex-M peripherals
+        defmt::info!("init");
         let mut core = ctx.core;
         // Device specific peripherals
         let mut  device: nrf52840_hal::pac::Peripherals = ctx.device;
         device.P1.dir.write(|w| w.pin10().output());
         toggle_status_led(&mut device.P1);
 
-        //defmt::info!("init");
         // Initialize (enable) the monotonic timer (CYCCNT)
+        defmt::info!("configure sys timer");
         configure_systimer(&mut core);
 
         // semantically, the monotonic timer is frozen at time "zero" during `init`
         // NOTE do *not* call `Instant::now` in this context; it will return a nonsense value
+        defmt::info!("schedule task");
         ctx.schedule
             .measure_bmp_pressure(ctx.start + PERIOD.cycles())
             .unwrap();
 
 
         // Setup i2c pins and peripheral
-        let mut twim = create_twim0(device.P0, device.TWIM0);
-        let bmp280 = create_bmp280(&mut twim);
+        let p0 = Parts::new(device.P0);
+        //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
+//        let scl_pin = p0.p0_11.into_floating_input();
+//        let sda_pin = p0.p0_12.into_floating_input();
+//        let twim_pins = TwimPins {
+//            scl: scl_pin.degrade(),
+//            sda: sda_pin.degrade(),
+//        };
+//        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
+
+        let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
+        let miso_pin = p0.p0_15.into_floating_input();
+        let sck_pin = p0.p0_14.into_push_pull_output(Level::High);
+
+        let spim_pins = SpimPins {
+            sck: sck_pin.degrade(),
+            mosi: Some(mosi_pin.degrade()),
+            miso: Some(miso_pin.degrade())
+        };
+        let mode = SpimMode{
+            polarity: Polarity::IdleLow,
+            phase: Phase::CaptureOnFirstTransition
+        };
+        defmt::info!("create spim");
+        let mut spim = Spim::new(device.SPIM0, spim_pins, SpimFrequency::K500, mode, 0xFF);
+        defmt::info!("created spim");
+
+        let mut buffer = [0xAB, 0xEA, 0x1E];
+        let mut spi_cs = p0.p0_08.into_push_pull_output(Level::High).degrade();
+
+        let result = spim.write(&mut spi_cs, &mut buffer);
+        defmt::info!("spi result is ok {:?}", result.is_ok());
+
+        //let bmp280 = create_bmp280(&mut twim);
+
+        defmt::info!("created late resources");
         init::LateResources {
-            twim,
+            //twim,
             port_one: device.P1,
-            bmp280,
+            //bmp280,
+            spim
         }
     }
 
@@ -63,19 +103,19 @@ const APP: () = {
         loop {}
     }
 
-    #[task(schedule = [measure_bmp_pressure], resources = [twim, port_one, bmp280])]
+    #[task(schedule = [measure_bmp_pressure], resources = [port_one])]
     fn measure_bmp_pressure(ctx: measure_bmp_pressure::Context) {
         defmt::info!("measure_bmp_pressure");
-        let mut twim = ctx.resources.twim;
-
-        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
-        defmt::info!("pressure: {:?}", pressure);
-        if let Ok(p) = pressure {
-            defmt::info!("pressure: {:?} pa", p / 256);
-        }
-
-        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
-        defmt::info!("temperature: {:?}", temperature);
+//        let mut twim = ctx.resources.twim;
+//
+//        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
+//        defmt::info!("pressure: {:?}", pressure);
+//        if let Ok(p) = pressure {
+//            defmt::info!("pressure: {:?} pa", p / 256);
+//        }
+//
+//        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
+//        defmt::info!("temperature: {:?}", temperature);
 
         toggle_status_led(ctx.resources.port_one);
 
@@ -105,17 +145,33 @@ fn configure_systimer(core: &mut rtic::Peripherals) {
     core.DWT.enable_cycle_counter();
 }
 
-fn create_twim0(p0: nrf52840_hal::pac::P0, twim0: TWIM0) -> Twim<TWIM0> {
-    let p0 = Parts::new(p0);
-    let scl_pin = p0.p0_11.into_floating_input();
-    let sda_pin = p0.p0_12.into_floating_input();
-    let twim_pins = TwimPins {
-        scl: scl_pin.degrade(),
-        sda: sda_pin.degrade(),
-    };
-    Twim::new(twim0, twim_pins, FREQUENCY_A::K100)
-}
-
+//fn create_twim0(p0: &mut Parts, twim0: TWIM0) -> Twim<TWIM0> {
+//    let scl_pin = p0.p0_11.into_floating_input();
+//    let sda_pin = p0.p0_12.into_floating_input();
+//    let twim_pins = TwimPins {
+//        scl: scl_pin.degrade(),
+//        sda: sda_pin.degrade(),
+//    };
+//    Twim::new(twim0, twim_pins, FREQUENCY_A::K100)
+//}
+//
+//fn create_spim0(p0: &mut Parts, spim0: SPIM0) -> Spim<SPIM0> {
+//    let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
+//    let miso_pin = p0.p0_12.into_floating_input();
+//    let sck_pin = p0.p0_15.into_push_pull_output(Level::High);
+//
+//    let spim_pins = SpimPins {
+//        sck: sck_pin.degrade(),
+//        mosi: Some(mosi_pin.degrade()),
+//        miso: Some(miso_pin.degrade())
+//    };
+//    let mode = SpimMode{
+//        polarity: Polarity::IdleLow,
+//        phase: Phase::CaptureOnFirstTransition
+//
+//    };
+//    Spim::new(spim0, spim_pins, SpimFrequency::K500, mode, 0x00)
+//}
 fn create_bmp280(twim: &mut Twim<TWIM0>) -> BMP280<Twim<TWIM0>, ModeNormal> {
     BMP280::new(
         twim,
