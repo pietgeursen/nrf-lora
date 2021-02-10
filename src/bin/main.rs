@@ -21,12 +21,17 @@ use bmp280_rs::*;
 use rtic::cyccnt::U32Ext as _;
 const PERIOD: u32 = 64_000_000;
 
+enum DisableableSpim{
+    enabled(Spim<SPIM0>),
+    disabled(SPIM0)
+}
+
 #[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
-        //twim: Twim<TWIM0>,
+        twim: Twim<TWIM0>,
         spim: Spim<SPIM0>,
-        //bmp280: BMP280<Twim<TWIM0>, ModeNormal>,
+        bmp280: BMP280<Twim<TWIM0>, ModeNormal>,
         port_one: P1,
     }
 
@@ -51,18 +56,19 @@ const APP: () = {
             .measure_bmp_pressure(ctx.start + PERIOD.cycles())
             .unwrap();
 
-
         // Setup i2c pins and peripheral
         let p0 = Parts::new(device.P0);
         //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
-//        let scl_pin = p0.p0_11.into_floating_input();
-//        let sda_pin = p0.p0_12.into_floating_input();
-//        let twim_pins = TwimPins {
-//            scl: scl_pin.degrade(),
-//            sda: sda_pin.degrade(),
-//        };
-//        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
+        let scl_pin = p0.p0_11.into_floating_input();
+        let sda_pin = p0.p0_12.into_floating_input();
+        let twim_pins = TwimPins {
+            scl: scl_pin.degrade(),
+            sda: sda_pin.degrade(),
+        };
+        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
+        let bmp280 = create_bmp280(&mut twim);
+        twim.disable();
 
         let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
         let miso_pin = p0.p0_15.into_floating_input();
@@ -81,19 +87,19 @@ const APP: () = {
         let mut spim = Spim::new(device.SPIM0, spim_pins, SpimFrequency::K500, mode, 0xFF);
         defmt::info!("created spim");
 
-        let mut buffer = [0xAB, 0xEA, 0x1E];
+        let hello = b"hello world";
+        let mut buffer = [0u8; 11];
+        buffer.copy_from_slice(&hello[..]);
         let mut spi_cs = p0.p0_08.into_push_pull_output(Level::High).degrade();
 
-        let result = spim.write(&mut spi_cs, &mut buffer);
+        let result = spim.write(&mut spi_cs, &buffer[..]);
         defmt::info!("spi result is ok {:?}", result.is_ok());
-
-        //let bmp280 = create_bmp280(&mut twim);
 
         defmt::info!("created late resources");
         init::LateResources {
-            //twim,
+            twim,
             port_one: device.P1,
-            //bmp280,
+            bmp280,
             spim
         }
     }
@@ -103,19 +109,21 @@ const APP: () = {
         loop {}
     }
 
-    #[task(schedule = [measure_bmp_pressure], resources = [port_one])]
+    #[task(schedule = [measure_bmp_pressure], resources = [port_one, twim, bmp280])]
     fn measure_bmp_pressure(ctx: measure_bmp_pressure::Context) {
         defmt::info!("measure_bmp_pressure");
-//        let mut twim = ctx.resources.twim;
-//
-//        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
-//        defmt::info!("pressure: {:?}", pressure);
-//        if let Ok(p) = pressure {
-//            defmt::info!("pressure: {:?} pa", p / 256);
-//        }
-//
-//        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
-//        defmt::info!("temperature: {:?}", temperature);
+        let mut twim = ctx.resources.twim;
+        twim.enable();
+
+        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
+        defmt::info!("pressure: {:?}", pressure);
+        if let Ok(p) = pressure {
+            defmt::info!("pressure: {:?} pa", p / 256);
+        }
+
+        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
+        twim.disable();
+        defmt::info!("temperature: {:?}", temperature);
 
         toggle_status_led(ctx.resources.port_one);
 
