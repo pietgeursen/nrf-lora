@@ -77,7 +77,7 @@ const APP: () = {
         toggle_status_led(&mut device.P1);
 
         // Initialize (enable) the monotonic timer (CYCCNT)
-        defmt::info!("configure sys timer");
+        defmt::trace!("configure sys timer");
         configure_systimer(&mut core);
 
         // semantically, the monotonic timer is frozen at time "zero" during `init`
@@ -137,7 +137,7 @@ const APP: () = {
             .input_pin(&rfm_irq)
             .lo_to_hi()
             .enable_interrupt();
-        defmt::info!("enabled rfm irq interrupt");
+        defmt::trace!("enabled rfm irq interrupt");
 
         let config = RfmConfig {
             implicit_header_mode_on: false,
@@ -149,12 +149,12 @@ const APP: () = {
         };
 
         let mut rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
-        defmt::info!("created rfm95");
+        defmt::trace!("created rfm95");
 
         rfm95
             .set_frequency(&mut spim, Frequency::new::<kilohertz>(915000))
             .unwrap();
-        defmt::info!("set rfm95 freq");
+        defmt::trace!("set rfm95 freq");
 
         // Enable tx done mask
         rfm95
@@ -170,7 +170,7 @@ const APP: () = {
 
         ctx.spawn.tx_data().unwrap();
 
-        defmt::info!("created late resources");
+        defmt::trace!("created late resources");
 
         //device.QSPI.psel.sck = p0.p0_20;
         init::LateResources {
@@ -184,7 +184,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine])]
     fn tx_data(mut ctx: tx_data::Context) {
-        defmt::info!("tx_data");
+        defmt::trace!("tx_data");
         // clear the tx interrupt in the rfm95
         let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
 
@@ -209,7 +209,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine])]
     fn rx_data(mut ctx: rx_data::Context) {
-        defmt::info!("rx_data");
+        defmt::trace!("rx_data");
         // clear the tx interrupt in the rfm95
         ctx.resources
             .rfm95
@@ -232,7 +232,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[rx_data])]
     fn tx_complete(mut ctx: tx_complete::Context) {
-        defmt::info!("tx_complete");
+        defmt::trace!("tx_complete");
         ctx.resources
             .rfm95
             .read_update_write_packed_struct::<_, _, 1>(
@@ -250,7 +250,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine, port_one], spawn=[tx_data])]
     fn rx_complete(mut ctx: rx_complete::Context) {
-        defmt::info!("rx_complete");
+        defmt::trace!("rx_complete");
         // clear the rx interrupt in the rfm95
         let irq_flags = ctx
             .resources
@@ -301,11 +301,11 @@ const APP: () = {
     #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.channel0().is_event_triggered() {
-            defmt::info!("Interrupt from channel 0 event");
+            defmt::trace!("Interrupt from channel 0 event");
             ctx.spawn.handle_rfm_interrupt().unwrap();
         }
         if ctx.resources.gpiote.port().is_event_triggered() {
-            defmt::info!("Interrupt from port event");
+            defmt::trace!("Interrupt from port event");
         }
         // Reset all events
         ctx.resources.gpiote.reset_events();
@@ -344,7 +344,6 @@ const APP: () = {
 
 fn toggle_status_led(port_one: &mut nrf52840_hal::pac::P1) {
     port_one.out.modify(|r, w| {
-        defmt::info!("toggle led");
         let current = r.pin10().bit();
         w.pin10().bit(!current)
     });
