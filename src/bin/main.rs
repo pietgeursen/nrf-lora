@@ -248,7 +248,7 @@ const APP: () = {
         ctx.spawn.rx_data().unwrap();
     }
 
-    #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[tx_data])]
+    #[task(resources=[rfm95, spim, rfm_state_machine, port_one], spawn=[tx_data])]
     fn rx_complete(mut ctx: rx_complete::Context) {
         defmt::info!("rx_complete");
         // clear the rx interrupt in the rfm95
@@ -273,6 +273,7 @@ const APP: () = {
 
         if irq_flags.rx_done && !irq_flags.payload_crc_error {
             defmt::info!("valid rx complete");
+            toggle_status_led(ctx.resources.port_one);
         }
 
         *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
@@ -343,6 +344,7 @@ const APP: () = {
 
 fn toggle_status_led(port_one: &mut nrf52840_hal::pac::P1) {
     port_one.out.modify(|r, w| {
+        defmt::info!("toggle led");
         let current = r.pin10().bit();
         w.pin10().bit(!current)
     });
