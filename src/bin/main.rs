@@ -59,7 +59,10 @@ const APP: () = {
 
     #[idle]
     fn idle(_ctx: idle::Context) -> ! {
-        loop {}
+        loop {
+            defmt::info!("idle");
+            cortex_m::asm::wfi();
+        }
     }
 
     #[init(schedule = [measure_bmp_pressure], spawn=[tx_data])]
@@ -79,10 +82,10 @@ const APP: () = {
 
         // semantically, the monotonic timer is frozen at time "zero" during `init`
         // NOTE do *not* call `Instant::now` in this context; it will return a nonsense value
-        defmt::info!("schedule task");
-        ctx.schedule
-            .measure_bmp_pressure(ctx.start + PERIOD.cycles())
-            .unwrap();
+        //        defmt::info!("schedule task");
+        //        ctx.schedule
+        //            .measure_bmp_pressure(ctx.start + PERIOD.cycles())
+        //            .unwrap();
 
         // Setup i2c pins and peripheral
         let p0 = Parts::new(device.P0);
@@ -181,6 +184,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine])]
     fn tx_data(mut ctx: tx_data::Context) {
+        defmt::info!("tx_data");
         // clear the tx interrupt in the rfm95
         let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
 
@@ -205,7 +209,7 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine])]
     fn rx_data(mut ctx: rx_data::Context) {
-        defmt::trace!("rx_data");
+        defmt::info!("rx_data");
         // clear the tx interrupt in the rfm95
         ctx.resources
             .rfm95
@@ -218,15 +222,17 @@ const APP: () = {
             )
             .unwrap();
 
-        ctx.resources.rfm95.receive_data(&mut ctx.resources.spim).unwrap();
+        ctx.resources
+            .rfm95
+            .receive_data(&mut ctx.resources.spim)
+            .unwrap();
 
         *ctx.resources.rfm_state_machine = RfmStateMachine::Receiving;
-
     }
 
     #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[rx_data])]
     fn tx_complete(mut ctx: tx_complete::Context) {
-        defmt::trace!("tx_complete");
+        defmt::info!("tx_complete");
         ctx.resources
             .rfm95
             .read_update_write_packed_struct::<_, _, 1>(
@@ -244,8 +250,14 @@ const APP: () = {
 
     #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[tx_data])]
     fn rx_complete(mut ctx: rx_complete::Context) {
-        defmt::trace!("rx_complete");
+        defmt::info!("rx_complete");
         // clear the rx interrupt in the rfm95
+        let irq_flags = ctx
+            .resources
+            .rfm95
+            .read_packed_struct::<IrqFlags, 1>(&mut ctx.resources.spim, LoraRegisters::IrqFlags)
+            .unwrap();
+
         ctx.resources
             .rfm95
             .read_update_write_packed_struct::<_, _, 1>(
@@ -253,16 +265,22 @@ const APP: () = {
                 LoraRegisters::IrqFlags,
                 |masks: &mut IrqFlags| {
                     masks.rx_done = true;
+                    masks.payload_crc_error = true;
+                    masks.rx_timeout = true;
                 },
             )
             .unwrap();
+
+        if irq_flags.rx_done && !irq_flags.payload_crc_error {
+            defmt::info!("valid rx complete");
+        }
 
         *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
         ctx.spawn.tx_data().unwrap();
     }
 
     #[task(resources=[rfm_state_machine], spawn=[tx_complete, rx_complete])]
-    fn handle_rfm_interrupt(mut ctx: handle_rfm_interrupt::Context) {
+    fn handle_rfm_interrupt(ctx: handle_rfm_interrupt::Context) {
         defmt::trace!("handle_rfm_interrupt");
         match ctx.resources.rfm_state_machine {
             RfmStateMachine::Transmitting => {
@@ -283,7 +301,7 @@ const APP: () = {
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.channel0().is_event_triggered() {
             defmt::info!("Interrupt from channel 0 event");
-            ctx.spawn.handle_rfm_interrupt();
+            ctx.spawn.handle_rfm_interrupt().unwrap();
         }
         if ctx.resources.gpiote.port().is_event_triggered() {
             defmt::info!("Interrupt from port event");
