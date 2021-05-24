@@ -1,18 +1,31 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::gpio::p0::Parts;
+use nrf52840_hal::delay::Delay;
+use nrf52840_hal::gpio::Level;
 use nrf52840_hal::pac::twim0::frequency::FREQUENCY_A;
 use nrf52840_hal::pac::P1;
-use nrf52840_hal::pac::{DWT, TWIM0, SPIM0};
-use nrf52840_hal::twim::Pins as TwimPins;
-use nrf52840_hal::spim::{Pins as SpimPins, Mode as SpimMode, Polarity, Phase, Frequency as SpimFrequency};
-use nrf52840_hal::{Twim, Spim};
-use nrf52840_hal::gpio::Level;
+use nrf52840_hal::pac::{DWT, SPIM0, TWIM0};
 use nrf52840_hal::prelude::*;
+use nrf52840_hal::spim::{
+    Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
+};
+use nrf52840_hal::twim::Pins as TwimPins;
+use nrf52840_hal::Timer;
+use nrf52840_hal::{gpio::p0::Parts, gpiote::*, pac::GPIOTE};
+use nrf52840_hal::{Spim, Twim};
 use nrf_bamboo_rs as _;
+use rfm95_rs::{
+    lora::{
+        dio_mapping::*,
+        frequency_rf::*,
+        irq_masks::IrqMasks,
+        modem_config1::{Bandwidth, CodingRate},
+        modem_config2::SpreadingFactor,
+    },
+    Config as RfmConfig, LoraRegisters, RFM95,
+};
 use rtic::app;
-use rfm95_rs::{RFM95, Config as RfmConfig};
 
 use apds9960::*;
 //use bamboo_rs_core::entry::*;
@@ -20,17 +33,18 @@ use apds9960::*;
 use bmp280_rs::*;
 
 use rtic::cyccnt::U32Ext as _;
-const PERIOD: u32 = 64_000_000;
+const PERIOD: u32 = 128_000_000;
 
-enum DisableableSpim{
+enum DisableableSpim {
     enabled(Spim<SPIM0>),
-    disabled(SPIM0)
+    disabled(SPIM0),
 }
 
 #[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
         port_one: P1,
+        gpiote: Gpiote,
     }
 
     #[init(schedule = [measure_bmp_pressure])]
@@ -39,7 +53,7 @@ const APP: () = {
         defmt::info!("init");
         let mut core = ctx.core;
         // Device specific peripherals
-        let mut  device: nrf52840_hal::pac::Peripherals = ctx.device;
+        let mut device: nrf52840_hal::pac::Peripherals = ctx.device;
         device.P1.dir.write(|w| w.pin10().output());
         toggle_status_led(&mut device.P1);
 
@@ -58,41 +72,110 @@ const APP: () = {
         let p0 = Parts::new(device.P0);
         //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
-//        let scl_pin = p0.p0_11.into_floating_input();
-//        let sda_pin = p0.p0_12.into_floating_input();
-//        let twim_pins = TwimPins {
-//            scl: scl_pin.degrade(),
-//            sda: sda_pin.degrade(),
-//        };
-//        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
-//        let bmp280 = create_bmp280(&mut twim);
-//        twim.disable();
+        //        let scl_pin = p0.p0_11.into_floating_input();
+        //        let sda_pin = p0.p0_12.into_floating_input();
+        //        let twim_pins = TwimPins {
+        //            scl: scl_pin.degrade(),
+        //            sda: sda_pin.degrade(),
+        //        };
+        //        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
+        //        let bmp280 = create_bmp280(&mut twim);
+        //        twim.disable();
 
+        // Feather pin MOSI
         let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
+        // Feather pin MISO
         let miso_pin = p0.p0_15.into_floating_input();
+        // Feather pin SCK
         let sck_pin = p0.p0_14.into_push_pull_output(Level::High);
 
         let spim_pins = SpimPins {
             sck: sck_pin.degrade(),
             mosi: Some(mosi_pin.degrade()),
-            miso: Some(miso_pin.degrade())
+            miso: Some(miso_pin.degrade()),
         };
-        let mode = SpimMode{
+        let mode = SpimMode {
             polarity: Polarity::IdleLow,
-            phase: Phase::CaptureOnFirstTransition
+            phase: Phase::CaptureOnFirstTransition,
         };
         defmt::info!("create spim");
         let mut spim = Spim::new(device.SPIM0, spim_pins, SpimFrequency::K500, mode, 0xFF);
         defmt::info!("created spim");
 
-        let spi_cs = p0.p0_08.into_push_pull_output(Level::High);
+        let delay_timer = Timer::new(device.TIMER3);
 
-        let rfm95 = RFM95::new(&mut spim, spi_cs, RfmConfig{})
+        // Feather pin D12
+        let spi_cs = p0.p0_08.into_push_pull_output(Level::High);
+        // Feather pin D11
+        let rfm_irq = p0.p0_06.into_pullup_input().degrade();
+        // Feather pin D10
+        let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
+
+
+        // Feather buttone 
+        //let button = .p1_02.into_pullup_input().degrade();
+
+        let gpiote = Gpiote::new(device.GPIOTE);
+
+        // Enable interrupt from rfm d0 interrrupt pin.
+        gpiote
+            .channel0()
+            .input_pin(&rfm_irq)
+            .lo_to_hi()
+            .enable_interrupt();
+        defmt::info!("enabled rfm irq interrupt");
+
+        let config = RfmConfig {
+            implicit_header_mode_on: false,
+            bandwidth: Bandwidth::K125,
+            coding_rate: CodingRate::Rate4_5,
+            low_frequency_mode: false,
+            rx_payload_crc_on: true,
+            spreading_factor: SpreadingFactor::Seven,
+        };
+
+        let mut rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
+        defmt::info!("created rfm95");
+
+        rfm95
+            .set_frequency(&mut spim, Frequency::new::<kilohertz>(915000))
+            .unwrap();
+        defmt::info!("set rfm95 freq");
+
+        // Enable tx done mask
+        rfm95
+            .read_update_write_packed_struct::<_, _, 1>(
+                &mut spim,
+                LoraRegisters::IrqFlagsMask,
+                |masks: &mut IrqMasks| {
+                    masks.tx_done = false;
+                },
+            )
+            .unwrap();
+
+        rfm95
+            .read_update_write_packed_struct::<_, _, 2>(
+                &mut spim,
+                LoraRegisters::DioMapping1,
+                |mapping: &mut DioMapping| {
+                    mapping.dio_0_mapping = Dio0Mapping::TxDone;
+                },
+            )
+            .unwrap();
+
+        //rfm95.set_carrier_test_on(&mut spim).unwrap();
+        let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
+
+        rfm95
+            .transmit_data(&mut spim, &mut data_to_transmit)
             .unwrap();
 
         defmt::info!("created late resources");
+
+        //device.QSPI.psel.sck = p0.p0_20;
         init::LateResources {
             port_one: device.P1,
+            gpiote,
         }
     }
 
@@ -101,21 +184,34 @@ const APP: () = {
         loop {}
     }
 
+    #[task(binds = GPIOTE, resources = [gpiote])]
+    fn on_gpiote(ctx: on_gpiote::Context) {
+        defmt::info!("got an interrupt!");
+        if ctx.resources.gpiote.channel0().is_event_triggered() {
+            defmt::info!("Interrupt from channel 0 event");
+        }
+        if ctx.resources.gpiote.port().is_event_triggered() {
+            defmt::info!("Interrupt from port event");
+        }
+        // Reset all events
+        ctx.resources.gpiote.reset_events();
+    }
+
     #[task(schedule = [measure_bmp_pressure], resources = [port_one])]
     fn measure_bmp_pressure(ctx: measure_bmp_pressure::Context) {
         defmt::info!("measure_bmp_pressure");
-//        let mut twim = ctx.resources.twim;
-//        twim.enable();
-//
-//        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
-//        defmt::info!("pressure: {:?}", pressure);
-//        if let Ok(p) = pressure {
-//            defmt::info!("pressure: {:?} pa", p / 256);
-//        }
-//
-//        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
-//        twim.disable();
-//        defmt::info!("temperature: {:?}", temperature);
+        //        let mut twim = ctx.resources.twim;
+        //        twim.enable();
+        //
+        //        let pressure = ctx.resources.bmp280.read_pressure(&mut twim);
+        //        defmt::info!("pressure: {:?}", pressure);
+        //        if let Ok(p) = pressure {
+        //            defmt::info!("pressure: {:?} pa", p / 256);
+        //        }
+        //
+        //        let temperature = ctx.resources.bmp280.read_temperature(&mut twim);
+        //        twim.disable();
+        //        defmt::info!("temperature: {:?}", temperature);
 
         toggle_status_led(ctx.resources.port_one);
 
