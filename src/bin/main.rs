@@ -1,33 +1,31 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::delay::Delay;
-use nrf52840_hal::gpio::Level;
-use nrf52840_hal::pac::twim0::frequency::FREQUENCY_A;
+use nrf52840_hal::gpio::{Level, Output, Pin, PushPull};
 use nrf52840_hal::pac::P1;
-use nrf52840_hal::pac::{DWT, SPIM0, TWIM0};
-use nrf52840_hal::prelude::*;
+use nrf52840_hal::pac::{DWT, SPIM0, TIMER3, TWIM0};
 use nrf52840_hal::spim::{
     Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
 };
-use nrf52840_hal::twim::Pins as TwimPins;
+use nrf52840_hal::timer::OneShot;
 use nrf52840_hal::Timer;
-use nrf52840_hal::{gpio::p0::Parts, gpiote::*, pac::GPIOTE};
+use nrf52840_hal::{gpio::p0::Parts, gpiote::*};
 use nrf52840_hal::{Spim, Twim};
 use nrf_bamboo_rs as _;
 use rfm95_rs::{
     lora::{
         dio_mapping::*,
         frequency_rf::*,
-        irq_masks::IrqMasks,
+        irq_flags::IrqFlags,
+        irq_masks::{IrqMask, IrqMasks},
         modem_config1::{Bandwidth, CodingRate},
         modem_config2::SpreadingFactor,
     },
-    Config as RfmConfig, LoraRegisters, RFM95,
+    Config as RfmConfig, LoRaMode, LoraRegisters, RFM95,
 };
 use rtic::app;
 
-use apds9960::*;
+//use apds9960::*;
 //use bamboo_rs_core::entry::*;
 //use bamboo_rs_core::*;
 use bmp280_rs::*;
@@ -35,23 +33,41 @@ use bmp280_rs::*;
 use rtic::cyccnt::U32Ext as _;
 const PERIOD: u32 = 128_000_000;
 
-enum DisableableSpim {
-    enabled(Spim<SPIM0>),
-    disabled(SPIM0),
+pub enum RfmStateMachine {
+    Idle,
+    Transmitting,
+    TransmitComplete,
+    Receiving,
+    ReceivingComplete,
 }
 
 #[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
+        rfm_state_machine: RfmStateMachine,
         port_one: P1,
         gpiote: Gpiote,
+        spim: Spim<SPIM0>,
+        rfm95: RFM95<
+            Spim<SPIM0>,
+            LoRaMode,
+            Pin<Output<PushPull>>,
+            Pin<Output<PushPull>>,
+            Timer<TIMER3, OneShot>,
+        >,
     }
 
-    #[init(schedule = [measure_bmp_pressure])]
+    #[idle]
+    fn idle(_ctx: idle::Context) -> ! {
+        loop {}
+    }
+
+    #[init(schedule = [measure_bmp_pressure], spawn=[tx_data])]
     fn init(ctx: init::Context) -> init::LateResources {
         // Cortex-M peripherals
         defmt::info!("init");
         let mut core = ctx.core;
+
         // Device specific peripherals
         let mut device: nrf52840_hal::pac::Peripherals = ctx.device;
         device.P1.dir.write(|w| w.pin10().output());
@@ -70,6 +86,7 @@ const APP: () = {
 
         // Setup i2c pins and peripheral
         let p0 = Parts::new(device.P0);
+
         //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
         //        let scl_pin = p0.p0_11.into_floating_input();
@@ -98,22 +115,16 @@ const APP: () = {
             polarity: Polarity::IdleLow,
             phase: Phase::CaptureOnFirstTransition,
         };
-        defmt::info!("create spim");
         let mut spim = Spim::new(device.SPIM0, spim_pins, SpimFrequency::K500, mode, 0xFF);
-        defmt::info!("created spim");
 
         let delay_timer = Timer::new(device.TIMER3);
 
         // Feather pin D12
-        let spi_cs = p0.p0_08.into_push_pull_output(Level::High);
+        let spi_cs = p0.p0_08.into_push_pull_output(Level::High).degrade();
         // Feather pin D11
         let rfm_irq = p0.p0_06.into_pullup_input().degrade();
         // Feather pin D10
         let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
-
-
-        // Feather buttone 
-        //let button = .p1_02.into_pullup_input().degrade();
 
         let gpiote = Gpiote::new(device.GPIOTE);
 
@@ -148,14 +159,35 @@ const APP: () = {
                 &mut spim,
                 LoraRegisters::IrqFlagsMask,
                 |masks: &mut IrqMasks| {
-                    masks.tx_done = false;
+                    masks.tx_done = IrqMask::Enabled;
+                    masks.rx_done = IrqMask::Enabled;
                 },
             )
             .unwrap();
 
-        rfm95
+        ctx.spawn.tx_data().unwrap();
+
+        defmt::info!("created late resources");
+
+        //device.QSPI.psel.sck = p0.p0_20;
+        init::LateResources {
+            rfm_state_machine: RfmStateMachine::Idle,
+            port_one: device.P1,
+            gpiote,
+            rfm95,
+            spim,
+        }
+    }
+
+    #[task(resources=[rfm95, spim, rfm_state_machine])]
+    fn tx_data(mut ctx: tx_data::Context) {
+        // clear the tx interrupt in the rfm95
+        let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
+
+        ctx.resources
+            .rfm95
             .read_update_write_packed_struct::<_, _, 2>(
-                &mut spim,
+                &mut ctx.resources.spim,
                 LoraRegisters::DioMapping1,
                 |mapping: &mut DioMapping| {
                     mapping.dio_0_mapping = Dio0Mapping::TxDone;
@@ -163,32 +195,95 @@ const APP: () = {
             )
             .unwrap();
 
-        //rfm95.set_carrier_test_on(&mut spim).unwrap();
-        let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
+        *ctx.resources.rfm_state_machine = RfmStateMachine::Transmitting;
 
-        rfm95
-            .transmit_data(&mut spim, &mut data_to_transmit)
+        ctx.resources
+            .rfm95
+            .transmit_data(&mut ctx.resources.spim, &mut data_to_transmit)
+            .unwrap();
+    }
+
+    #[task(resources=[rfm95, spim, rfm_state_machine])]
+    fn rx_data(mut ctx: rx_data::Context) {
+        defmt::trace!("rx_data");
+        // clear the tx interrupt in the rfm95
+        ctx.resources
+            .rfm95
+            .read_update_write_packed_struct::<_, _, 2>(
+                &mut ctx.resources.spim,
+                LoraRegisters::DioMapping1,
+                |mapping: &mut DioMapping| {
+                    mapping.dio_0_mapping = Dio0Mapping::RxDone;
+                },
+            )
             .unwrap();
 
-        defmt::info!("created late resources");
+        ctx.resources.rfm95.receive_data(&mut ctx.resources.spim).unwrap();
 
-        //device.QSPI.psel.sck = p0.p0_20;
-        init::LateResources {
-            port_one: device.P1,
-            gpiote,
+        *ctx.resources.rfm_state_machine = RfmStateMachine::Receiving;
+
+    }
+
+    #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[rx_data])]
+    fn tx_complete(mut ctx: tx_complete::Context) {
+        defmt::trace!("tx_complete");
+        ctx.resources
+            .rfm95
+            .read_update_write_packed_struct::<_, _, 1>(
+                &mut ctx.resources.spim,
+                LoraRegisters::IrqFlags,
+                |masks: &mut IrqFlags| {
+                    masks.tx_done = true;
+                },
+            )
+            .unwrap();
+
+        *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
+        ctx.spawn.rx_data().unwrap();
+    }
+
+    #[task(resources=[rfm95, spim, rfm_state_machine], spawn=[tx_data])]
+    fn rx_complete(mut ctx: rx_complete::Context) {
+        defmt::trace!("rx_complete");
+        // clear the rx interrupt in the rfm95
+        ctx.resources
+            .rfm95
+            .read_update_write_packed_struct::<_, _, 1>(
+                &mut ctx.resources.spim,
+                LoraRegisters::IrqFlags,
+                |masks: &mut IrqFlags| {
+                    masks.rx_done = true;
+                },
+            )
+            .unwrap();
+
+        *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
+        ctx.spawn.tx_data().unwrap();
+    }
+
+    #[task(resources=[rfm_state_machine], spawn=[tx_complete, rx_complete])]
+    fn handle_rfm_interrupt(mut ctx: handle_rfm_interrupt::Context) {
+        defmt::trace!("handle_rfm_interrupt");
+        match ctx.resources.rfm_state_machine {
+            RfmStateMachine::Transmitting => {
+                *ctx.resources.rfm_state_machine = RfmStateMachine::TransmitComplete;
+                ctx.spawn.tx_complete().unwrap();
+            }
+            RfmStateMachine::Receiving => {
+                *ctx.resources.rfm_state_machine = RfmStateMachine::ReceivingComplete;
+                ctx.spawn.rx_complete().unwrap();
+            }
+            _ => {
+                defmt::info!("in handle_rfm_interrupt with unexpected state")
+            }
         }
     }
 
-    #[idle]
-    fn idle(_ctx: idle::Context) -> ! {
-        loop {}
-    }
-
-    #[task(binds = GPIOTE, resources = [gpiote])]
+    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
-        defmt::info!("got an interrupt!");
         if ctx.resources.gpiote.channel0().is_event_triggered() {
             defmt::info!("Interrupt from channel 0 event");
+            ctx.spawn.handle_rfm_interrupt();
         }
         if ctx.resources.gpiote.port().is_event_triggered() {
             defmt::info!("Interrupt from port event");
