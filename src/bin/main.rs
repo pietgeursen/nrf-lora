@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::gpio::{Level, Output, Pin, PushPull};
+use nrf52840_hal::gpio::{Input, Level, Output, Pin, PullUp, PushPull};
 use nrf52840_hal::pac::P1;
 use nrf52840_hal::pac::{DWT, SPIM0, TIMER3, TWIM0};
 use nrf52840_hal::spim::{
@@ -9,7 +9,7 @@ use nrf52840_hal::spim::{
 };
 use nrf52840_hal::timer::OneShot;
 use nrf52840_hal::Timer;
-use nrf52840_hal::{gpio::p0::Parts, gpiote::*};
+use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote::*};
 use nrf52840_hal::{Spim, Twim};
 use nrf_bamboo_rs as _;
 use rfm95_rs::{
@@ -20,9 +20,12 @@ use rfm95_rs::{
         irq_masks::{IrqMask, IrqMasks},
         modem_config1::{Bandwidth, CodingRate},
         modem_config2::SpreadingFactor,
+        modem_config3::{ModemConfig3, AGC, LowDataRateOptimize},
+        pa_config::{PaConfig, PaSelect}
     },
     Config as RfmConfig, LoRaMode, LoraRegisters, RFM95,
 };
+use nrf52840_hal::prelude::*;
 use rtic::app;
 
 //use apds9960::*;
@@ -31,7 +34,7 @@ use rtic::app;
 use bmp280_rs::*;
 
 use rtic::cyccnt::U32Ext as _;
-const PERIOD: u32 = 128_000_000;
+const PERIOD: u32 = 64_000_000;
 
 pub enum RfmStateMachine {
     Idle,
@@ -45,7 +48,7 @@ pub enum RfmStateMachine {
 const APP: () = {
     struct Resources {
         rfm_state_machine: RfmStateMachine,
-        port_one: P1,
+        status_led: Pin<Output<PushPull>>,
         gpiote: Gpiote,
         spim: Spim<SPIM0>,
         rfm95: RFM95<
@@ -60,8 +63,8 @@ const APP: () = {
     #[idle]
     fn idle(_ctx: idle::Context) -> ! {
         loop {
-            defmt::info!("idle");
-            cortex_m::asm::wfi();
+            //defmt::info!("idle");
+            //cortex_m::asm::wfi();
         }
     }
 
@@ -73,12 +76,10 @@ const APP: () = {
 
         // Device specific peripherals
         let mut device: nrf52840_hal::pac::Peripherals = ctx.device;
-        device.P1.dir.write(|w| w.pin10().output());
-        toggle_status_led(&mut device.P1);
-
         // Initialize (enable) the monotonic timer (CYCCNT)
         defmt::trace!("configure sys timer");
         configure_systimer(&mut core);
+
 
         // semantically, the monotonic timer is frozen at time "zero" during `init`
         // NOTE do *not* call `Instant::now` in this context; it will return a nonsense value
@@ -88,8 +89,10 @@ const APP: () = {
         //            .unwrap();
 
         // Setup i2c pins and peripheral
-        let p0 = Parts::new(device.P0);
+        let p0 = Parts0::new(device.P0);
+        let p1 = Parts1::new(device.P1);
 
+        let status_led = p1.p1_10.into_push_pull_output(Level::Low).degrade();
         //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
         //        let scl_pin = p0.p0_11.into_floating_input();
@@ -129,6 +132,8 @@ const APP: () = {
         // Feather pin D10
         let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
 
+        let switch = p1.p1_02.into_pullup_input().degrade();
+
         let gpiote = Gpiote::new(device.GPIOTE);
 
         // Enable interrupt from rfm d0 interrrupt pin.
@@ -139,13 +144,19 @@ const APP: () = {
             .enable_interrupt();
         defmt::trace!("enabled rfm irq interrupt");
 
+        gpiote
+            .channel1()
+            .input_pin(&switch)
+            .lo_to_hi()
+            .enable_interrupt();
+
         let config = RfmConfig {
             implicit_header_mode_on: false,
-            bandwidth: Bandwidth::K125,
-            coding_rate: CodingRate::Rate4_5,
+            bandwidth: Bandwidth::K62_5,
+            coding_rate: CodingRate::Rate4_8,
             low_frequency_mode: false,
             rx_payload_crc_on: true,
-            spreading_factor: SpreadingFactor::Seven,
+            spreading_factor: SpreadingFactor::Twelve,
         };
 
         let mut rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
@@ -168,6 +179,29 @@ const APP: () = {
             )
             .unwrap();
 
+        // Enable high power
+        rfm95
+            .read_update_write_packed_struct::<_, _, 1>(
+                &mut spim,
+                LoraRegisters::PaConfig,
+                |config: &mut PaConfig| {
+                    config.pa_select = PaSelect::PaBoost;
+                },
+            )
+            .unwrap();
+
+        // Enable low data rate and agc
+        rfm95
+            .read_update_write_packed_struct::<_, _, 1>(
+                &mut spim,
+                LoraRegisters::ModemConfig3,
+                |config: &mut ModemConfig3| {
+                    //config.agc = AGC::On;
+                    config.low_data_rate_optimize = LowDataRateOptimize::On;
+                },
+            )
+            .unwrap();
+
         ctx.spawn.tx_data().unwrap();
 
         defmt::trace!("created late resources");
@@ -175,18 +209,18 @@ const APP: () = {
         //device.QSPI.psel.sck = p0.p0_20;
         init::LateResources {
             rfm_state_machine: RfmStateMachine::Idle,
-            port_one: device.P1,
+            status_led,
             gpiote,
             rfm95,
             spim,
         }
     }
 
-    #[task(resources=[rfm95, spim, rfm_state_machine])]
+    #[task(resources=[rfm95, spim, rfm_state_machine], capacity=4)]
     fn tx_data(mut ctx: tx_data::Context) {
         defmt::trace!("tx_data");
         // clear the tx interrupt in the rfm95
-        let mut data_to_transmit = [1, 2, 3, 4, 3, 3, 3, 3, 2, 12, 32];
+        let mut data_to_transmit = [1,2,3,4,5,6,7,8,9,10];
 
         ctx.resources
             .rfm95
@@ -248,7 +282,7 @@ const APP: () = {
         ctx.spawn.rx_data().unwrap();
     }
 
-    #[task(resources=[rfm95, spim, rfm_state_machine, port_one], spawn=[tx_data])]
+    #[task(schedule=[tx_data], resources=[rfm95, spim, rfm_state_machine, status_led], spawn=[tx_data])]
     fn rx_complete(mut ctx: rx_complete::Context) {
         defmt::trace!("rx_complete");
         // clear the rx interrupt in the rfm95
@@ -273,11 +307,11 @@ const APP: () = {
 
         if irq_flags.rx_done && !irq_flags.payload_crc_error {
             defmt::info!("valid rx complete");
-            toggle_status_led(ctx.resources.port_one);
+            toggle_status_led(ctx.resources.status_led);
         }
 
         *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
-        ctx.spawn.tx_data().unwrap();
+        ctx.schedule.tx_data(ctx.scheduled + PERIOD.cycles()).unwrap();
     }
 
     #[task(resources=[rfm_state_machine], spawn=[tx_complete, rx_complete])]
@@ -298,12 +332,23 @@ const APP: () = {
         }
     }
 
-    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt])]
+    #[task(resources=[rfm_state_machine], spawn=[tx_data])]
+    fn handle_retry_interrupt(ctx: handle_retry_interrupt::Context) {
+        defmt::trace!("handle_rfm_interrupt");
+        ctx.spawn.tx_data().unwrap();
+    }
+
+    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.channel0().is_event_triggered() {
             defmt::trace!("Interrupt from channel 0 event");
             ctx.spawn.handle_rfm_interrupt().unwrap();
         }
+        if ctx.resources.gpiote.channel1().is_event_triggered() {
+            defmt::trace!("Interrupt from channel 1 event");
+            ctx.spawn.handle_retry_interrupt().unwrap();
+        }
+
         if ctx.resources.gpiote.port().is_event_triggered() {
             defmt::trace!("Interrupt from port event");
         }
@@ -311,7 +356,7 @@ const APP: () = {
         ctx.resources.gpiote.reset_events();
     }
 
-    #[task(schedule = [measure_bmp_pressure], resources = [port_one])]
+    #[task(schedule = [measure_bmp_pressure], resources = [status_led])]
     fn measure_bmp_pressure(ctx: measure_bmp_pressure::Context) {
         defmt::info!("measure_bmp_pressure");
         //        let mut twim = ctx.resources.twim;
@@ -327,7 +372,7 @@ const APP: () = {
         //        twim.disable();
         //        defmt::info!("temperature: {:?}", temperature);
 
-        toggle_status_led(ctx.resources.port_one);
+        toggle_status_led(ctx.resources.status_led);
 
         ctx.schedule
             .measure_bmp_pressure(ctx.scheduled + PERIOD.cycles())
@@ -342,11 +387,12 @@ const APP: () = {
     }
 };
 
-fn toggle_status_led(port_one: &mut nrf52840_hal::pac::P1) {
-    port_one.out.modify(|r, w| {
-        let current = r.pin10().bit();
-        w.pin10().bit(!current)
-    });
+fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
+    if led.is_set_high().unwrap() {
+        led.set_low().unwrap();
+    }else{
+        led.set_high().unwrap();
+    }
 }
 
 fn configure_systimer(core: &mut rtic::Peripherals) {
