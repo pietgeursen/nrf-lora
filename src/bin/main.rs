@@ -13,6 +13,7 @@ use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote:
 use nrf52840_hal::{Spim, Twim};
 use nrf_bamboo_rs as _;
 use rfm95_rs::{
+    size_bytes::SizeBytes,
     lora::{
         dio_mapping::*,
         frequency_rf::*,
@@ -169,9 +170,8 @@ const APP: () = {
 
         // Enable tx done mask
         rfm95
-            .read_update_write_packed_struct::<_, _, 1>(
+            .read_update_write_packed_struct::<_, _, {IrqMasks::SIZE}>(
                 &mut spim,
-                LoraRegisters::IrqFlagsMask,
                 |masks: &mut IrqMasks| {
                     masks.tx_done = IrqMask::Enabled;
                     masks.rx_done = IrqMask::Enabled;
@@ -181,9 +181,8 @@ const APP: () = {
 
         // Enable high power
         rfm95
-            .read_update_write_packed_struct::<_, _, 1>(
+            .read_update_write_packed_struct::<_, _, {PaConfig::SIZE}>(
                 &mut spim,
-                LoraRegisters::PaConfig,
                 |config: &mut PaConfig| {
                     config.pa_select = PaSelect::PaBoost;
                 },
@@ -192,9 +191,8 @@ const APP: () = {
 
         // Enable low data rate and agc
         rfm95
-            .read_update_write_packed_struct::<_, _, 1>(
+            .read_update_write_packed_struct::<_, _, {ModemConfig3::SIZE}>(
                 &mut spim,
-                LoraRegisters::ModemConfig3,
                 |config: &mut ModemConfig3| {
                     //config.agc = AGC::On;
                     config.low_data_rate_optimize = LowDataRateOptimize::On;
@@ -224,9 +222,8 @@ const APP: () = {
 
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, 2>(
+            .read_update_write_packed_struct::<_, _, {DioMapping::SIZE}>(
                 &mut ctx.resources.spim,
-                LoraRegisters::DioMapping1,
                 |mapping: &mut DioMapping| {
                     mapping.dio_0_mapping = Dio0Mapping::TxDone;
                 },
@@ -247,9 +244,8 @@ const APP: () = {
         // clear the tx interrupt in the rfm95
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, 2>(
+            .read_update_write_packed_struct::<_, _, {DioMapping::SIZE}>(
                 &mut ctx.resources.spim,
-                LoraRegisters::DioMapping1,
                 |mapping: &mut DioMapping| {
                     mapping.dio_0_mapping = Dio0Mapping::RxDone;
                 },
@@ -269,9 +265,8 @@ const APP: () = {
         defmt::trace!("tx_complete");
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, 1>(
+            .read_update_write_packed_struct::<_, _, {IrqFlags::SIZE}>(
                 &mut ctx.resources.spim,
-                LoraRegisters::IrqFlags,
                 |masks: &mut IrqFlags| {
                     masks.tx_done = true;
                 },
@@ -289,14 +284,13 @@ const APP: () = {
         let irq_flags = ctx
             .resources
             .rfm95
-            .read_packed_struct::<IrqFlags, 1>(&mut ctx.resources.spim, LoraRegisters::IrqFlags)
+            .read_packed_struct::<IrqFlags, {IrqFlags::SIZE}>(&mut ctx.resources.spim)
             .unwrap();
 
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, 1>(
+            .read_update_write_packed_struct::<_, _, {IrqFlags::SIZE}>(
                 &mut ctx.resources.spim,
-                LoraRegisters::IrqFlags,
                 |masks: &mut IrqFlags| {
                     masks.rx_done = true;
                     masks.payload_crc_error = true;
