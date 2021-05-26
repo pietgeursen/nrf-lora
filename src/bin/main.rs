@@ -1,9 +1,9 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::gpio::{Input, Level, Output, Pin, PullUp, PushPull};
-use nrf52840_hal::pac::P1;
+use nrf52840_hal::gpio::{Level, Output, Pin, PushPull};
 use nrf52840_hal::pac::{DWT, SPIM0, TIMER3, TWIM0};
+use nrf52840_hal::prelude::*;
 use nrf52840_hal::spim::{
     Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
 };
@@ -13,20 +13,21 @@ use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote:
 use nrf52840_hal::{Spim, Twim};
 use nrf_bamboo_rs as _;
 use rfm95_rs::{
-    size_bytes::SizeBytes,
     lora::{
         dio_mapping::*,
+        fei::*,
         frequency_rf::*,
         irq_flags::IrqFlags,
         irq_masks::{IrqMask, IrqMasks},
-        modem_config1::{Bandwidth, CodingRate},
+        modem_config1::{Bandwidth, CodingRate, ModemConfig1},
         modem_config2::SpreadingFactor,
-        modem_config3::{ModemConfig3, AGC, LowDataRateOptimize},
-        pa_config::{PaConfig, PaSelect}
+        modem_config3::{LowDataRateOptimize, ModemConfig3},
+        op_mode::Mode,
+        pa_config::{PaConfig, PaSelect},
     },
-    Config as RfmConfig, LoRaMode, LoraRegisters, RFM95,
+    size_bytes::SizeBytes,
+    Config as RfmConfig, LoRaMode, RFM95,
 };
-use nrf52840_hal::prelude::*;
 use rtic::app;
 
 //use apds9960::*;
@@ -35,7 +36,9 @@ use rtic::app;
 use bmp280_rs::*;
 
 use rtic::cyccnt::U32Ext as _;
-const PERIOD: u32 = 64_000_000;
+const PERIOD: u32 = 128_000_000;
+
+const TX_FREQUENCY_HZ: u32 = 915_000_000;
 
 pub enum RfmStateMachine {
     Idle,
@@ -59,6 +62,8 @@ const APP: () = {
             Pin<Output<PushPull>>,
             Timer<TIMER3, OneShot>,
         >,
+        ppm_correction: Option<PpmCorrection>,
+        rf_correction: Option<FrequencyRf>,
     }
 
     #[idle]
@@ -76,11 +81,10 @@ const APP: () = {
         let mut core = ctx.core;
 
         // Device specific peripherals
-        let mut device: nrf52840_hal::pac::Peripherals = ctx.device;
+        let device: nrf52840_hal::pac::Peripherals = ctx.device;
         // Initialize (enable) the monotonic timer (CYCCNT)
         defmt::trace!("configure sys timer");
         configure_systimer(&mut core);
-
 
         // semantically, the monotonic timer is frozen at time "zero" during `init`
         // NOTE do *not* call `Instant::now` in this context; it will return a nonsense value
@@ -153,7 +157,7 @@ const APP: () = {
 
         let config = RfmConfig {
             implicit_header_mode_on: false,
-            bandwidth: Bandwidth::K62_5,
+            bandwidth: Bandwidth::K125,
             coding_rate: CodingRate::Rate4_8,
             low_frequency_mode: false,
             rx_payload_crc_on: true,
@@ -164,13 +168,13 @@ const APP: () = {
         defmt::trace!("created rfm95");
 
         rfm95
-            .set_frequency(&mut spim, Frequency::new::<kilohertz>(915000))
+            .set_frequency(&mut spim, Frequency::new::<hertz>(TX_FREQUENCY_HZ))
             .unwrap();
         defmt::trace!("set rfm95 freq");
 
         // Enable tx done mask
         rfm95
-            .read_update_write_packed_struct::<_, _, {IrqMasks::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { IrqMasks::SIZE }>(
                 &mut spim,
                 |masks: &mut IrqMasks| {
                     masks.tx_done = IrqMask::Enabled;
@@ -181,7 +185,7 @@ const APP: () = {
 
         // Enable high power
         rfm95
-            .read_update_write_packed_struct::<_, _, {PaConfig::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { PaConfig::SIZE }>(
                 &mut spim,
                 |config: &mut PaConfig| {
                     config.pa_select = PaSelect::PaBoost;
@@ -191,7 +195,7 @@ const APP: () = {
 
         // Enable low data rate and agc
         rfm95
-            .read_update_write_packed_struct::<_, _, {ModemConfig3::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { ModemConfig3::SIZE }>(
                 &mut spim,
                 |config: &mut ModemConfig3| {
                     //config.agc = AGC::On;
@@ -206,6 +210,8 @@ const APP: () = {
 
         //device.QSPI.psel.sck = p0.p0_20;
         init::LateResources {
+            ppm_correction: None,
+            rf_correction: None,
             rfm_state_machine: RfmStateMachine::Idle,
             status_led,
             gpiote,
@@ -218,15 +224,24 @@ const APP: () = {
     fn tx_data(mut ctx: tx_data::Context) {
         defmt::trace!("tx_data");
         // clear the tx interrupt in the rfm95
-        let mut data_to_transmit = [1,2,3,4,5,6,7,8,9,10];
+        let mut data_to_transmit = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, {DioMapping::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { DioMapping::SIZE }>(
                 &mut ctx.resources.spim,
                 |mapping: &mut DioMapping| {
                     mapping.dio_0_mapping = Dio0Mapping::TxDone;
                 },
+            )
+            .unwrap();
+
+        // Set the tx freq back to 915.
+        ctx.resources
+            .rfm95
+            .set_frequency(
+                &mut ctx.resources.spim,
+                Frequency::new::<hertz>(TX_FREQUENCY_HZ),
             )
             .unwrap();
 
@@ -238,19 +253,36 @@ const APP: () = {
             .unwrap();
     }
 
-    #[task(resources=[rfm95, spim, rfm_state_machine])]
+    #[task(resources=[rfm95, spim, rfm_state_machine, ppm_correction, rf_correction])]
     fn rx_data(mut ctx: rx_data::Context) {
         defmt::trace!("rx_data");
         // clear the tx interrupt in the rfm95
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, {DioMapping::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { DioMapping::SIZE }>(
                 &mut ctx.resources.spim,
                 |mapping: &mut DioMapping| {
                     mapping.dio_0_mapping = Dio0Mapping::RxDone;
                 },
             )
             .unwrap();
+
+        if let Some(rf_correction) = ctx.resources.rf_correction {
+            defmt::trace!("updating rf_correction");
+            //let default_freq = Frequency::new::<hertz>(TX_FREQUENCY_HZ);
+            ctx.resources
+                .rfm95
+                .write_packed_struct::<FrequencyRf>(&mut ctx.resources.spim, rf_correction)
+                .unwrap();
+        }
+
+        if let Some(ppm_correction) = ctx.resources.ppm_correction {
+            defmt::trace!("updating ppm_correction");
+            ctx.resources
+                .rfm95
+                .write_packed_struct::<_>(&mut ctx.resources.spim, ppm_correction)
+                .unwrap();
+        }
 
         ctx.resources
             .rfm95
@@ -265,7 +297,7 @@ const APP: () = {
         defmt::trace!("tx_complete");
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, {IrqFlags::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { IrqFlags::SIZE }>(
                 &mut ctx.resources.spim,
                 |masks: &mut IrqFlags| {
                     masks.tx_done = true;
@@ -277,19 +309,19 @@ const APP: () = {
         ctx.spawn.rx_data().unwrap();
     }
 
-    #[task(schedule=[tx_data], resources=[rfm95, spim, rfm_state_machine, status_led], spawn=[tx_data])]
+    #[task(schedule=[tx_data], resources=[rfm95, spim, rfm_state_machine, status_led, rf_correction, ppm_correction], spawn=[tx_data])]
     fn rx_complete(mut ctx: rx_complete::Context) {
         defmt::trace!("rx_complete");
         // clear the rx interrupt in the rfm95
         let irq_flags = ctx
             .resources
             .rfm95
-            .read_packed_struct::<IrqFlags, {IrqFlags::SIZE}>(&mut ctx.resources.spim)
+            .read_packed_struct::<IrqFlags, { IrqFlags::SIZE }>(&mut ctx.resources.spim)
             .unwrap();
 
         ctx.resources
             .rfm95
-            .read_update_write_packed_struct::<_, _, {IrqFlags::SIZE}>(
+            .read_update_write_packed_struct::<_, _, { IrqFlags::SIZE }>(
                 &mut ctx.resources.spim,
                 |masks: &mut IrqFlags| {
                     masks.rx_done = true;
@@ -299,13 +331,44 @@ const APP: () = {
             )
             .unwrap();
 
+        let frq_err = ctx
+            .resources
+            .rfm95
+            .read_packed_struct::<Fei, { Fei::SIZE }>(&mut ctx.resources.spim)
+            .unwrap();
+
+        let bandwidth = ctx
+            .resources
+            .rfm95
+            .read_packed_struct::<ModemConfig1, { ModemConfig1::SIZE }>(&mut ctx.resources.spim)
+            .unwrap()
+            .bandwidth;
+
+        let current_freq = ctx
+            .resources
+            .rfm95
+            .read_packed_struct::<FrequencyRf, { FrequencyRf::SIZE }>(&mut ctx.resources.spim)
+            .unwrap();
+
+        let rf_correction = frq_err.frf_new(&current_freq, &bandwidth);
+        let ppm_correction = frq_err.ppm_correction(&current_freq, &bandwidth);
+        *ctx.resources.rf_correction = Some(rf_correction);
+        *ctx.resources.ppm_correction = Some(ppm_correction);
+
         if irq_flags.rx_done && !irq_flags.payload_crc_error {
             defmt::info!("valid rx complete");
             toggle_status_led(ctx.resources.status_led);
-        }
 
-        *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
-        ctx.schedule.tx_data(ctx.scheduled + PERIOD.cycles()).unwrap();
+            ctx.resources
+                .rfm95
+                .set_mode(ctx.resources.spim, Mode::Standby)
+                .unwrap();
+
+            *ctx.resources.rfm_state_machine = RfmStateMachine::Idle;
+            ctx.schedule
+                .tx_data(ctx.scheduled + PERIOD.cycles())
+                .unwrap();
+        }
     }
 
     #[task(resources=[rfm_state_machine], spawn=[tx_complete, rx_complete])]
@@ -384,7 +447,7 @@ const APP: () = {
 fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
     if led.is_set_high().unwrap() {
         led.set_low().unwrap();
-    }else{
+    } else {
         led.set_high().unwrap();
     }
 }

@@ -27,8 +27,8 @@ defmt-rtt = "0.1.0"
 [features]
 # set logging levels here
 default = [
-  "defmt-default",
-  # "dependency-a/defmt-trace",
+  #"defmt-default",
+  #"rfm95-rs/defmt-trace",
 ]
 
 # do NOT modify these features
