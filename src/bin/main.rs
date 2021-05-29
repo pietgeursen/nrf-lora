@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::gpio::{Level, Output, Pin, PushPull};
+use nrf52840_hal::gpio::{Disconnected, Level, Output, Pin, PushPull};
 use nrf52840_hal::pac::{DWT, SPIM0, TIMER3, TWIM0};
 use nrf52840_hal::prelude::*;
 use nrf52840_hal::spim::{
@@ -40,12 +40,51 @@ const PERIOD: u32 = 128_000_000;
 
 const TX_FREQUENCY_HZ: u32 = 915_000_000;
 
+pub enum RfmActions {
+    TxCompleted,
+    RxCompleted,
+    TxRetryButtonPressed,
+    StartTxCommandReceived,
+    StartRxCommandReceived,
+    StartCadCommandReceived,
+    CadDetected,
+    CadTimeout,
+}
+
 pub enum RfmStateMachine {
     Idle,
     Transmitting,
     TransmitComplete,
     Receiving,
     ReceivingComplete,
+    DetectingCad,
+    CadDetected,
+}
+
+impl RfmStateMachine {
+    pub fn dispatch<OnExit: FnMut(&Self), OnEnter: FnMut(&Self)>(
+        &mut self,
+        action: &RfmActions,
+        mut onExit: OnExit,
+        mut onEnter: OnEnter,
+    ) {
+        match self {
+            RfmStateMachine::Idle => match action {
+                RfmActions::StartTxCommandReceived => {
+                    onExit(self);
+                    *self = RfmStateMachine::Transmitting;
+                    onEnter(self);
+                }
+                _ => (),
+            },
+            RfmStateMachine::Transmitting => {}
+            RfmStateMachine::TransmitComplete => {}
+            RfmStateMachine::Receiving => {}
+            RfmStateMachine::ReceivingComplete => {}
+            RfmStateMachine::DetectingCad => {}
+            RfmStateMachine::CadDetected => {}
+        }
+    }
 }
 
 #[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
@@ -66,8 +105,8 @@ const APP: () = {
         rf_correction: Option<FrequencyRf>,
     }
 
-    #[idle]
-    fn idle(_ctx: idle::Context) -> ! {
+    #[idle(resources=[spim, rfm95])]
+    fn idle(ctx: idle::Context) -> ! {
         loop {
             //defmt::info!("idle");
             //cortex_m::asm::wfi();
@@ -86,47 +125,26 @@ const APP: () = {
         defmt::trace!("configure sys timer");
         configure_systimer(&mut core);
 
-        // semantically, the monotonic timer is frozen at time "zero" during `init`
-        // NOTE do *not* call `Instant::now` in this context; it will return a nonsense value
-        //        defmt::info!("schedule task");
-        //        ctx.schedule
-        //            .measure_bmp_pressure(ctx.start + PERIOD.cycles())
-        //            .unwrap();
-
-        // Setup i2c pins and peripheral
         let p0 = Parts0::new(device.P0);
         let p1 = Parts1::new(device.P1);
 
         let status_led = p1.p1_10.into_push_pull_output(Level::Low).degrade();
-        //let mut twim = create_twim0(&mut p0, device.TWIM0);
 
-        //        let scl_pin = p0.p0_11.into_floating_input();
-        //        let sda_pin = p0.p0_12.into_floating_input();
-        //        let twim_pins = TwimPins {
-        //            scl: scl_pin.degrade(),
-        //            sda: sda_pin.degrade(),
-        //        };
-        //        let mut twim = Twim::new(device.TWIM0, twim_pins, FREQUENCY_A::K100);
-        //        let bmp280 = create_bmp280(&mut twim);
-        //        twim.disable();
+        let gpiote = Gpiote::new(device.GPIOTE);
 
-        // Feather pin MOSI
-        let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
-        // Feather pin MISO
-        let miso_pin = p0.p0_15.into_floating_input();
-        // Feather pin SCK
-        let sck_pin = p0.p0_14.into_push_pull_output(Level::High);
+        let switch = p1.p1_02.into_pullup_input().degrade();
+        gpiote
+            .channel1()
+            .input_pin(&switch)
+            .lo_to_hi()
+            .enable_interrupt();
 
-        let spim_pins = SpimPins {
-            sck: sck_pin.degrade(),
-            mosi: Some(mosi_pin.degrade()),
-            miso: Some(miso_pin.degrade()),
-        };
-        let mode = SpimMode {
-            polarity: Polarity::IdleLow,
-            phase: Phase::CaptureOnFirstTransition,
-        };
-        let mut spim = Spim::new(device.SPIM0, spim_pins, SpimFrequency::K500, mode, 0xFF);
+        let mut spim = create_spim(
+            device.SPIM0,
+            p0.p0_13.degrade(),
+            p0.p0_12.degrade(),
+            p0.p0_15.degrade(),
+        );
 
         let delay_timer = Timer::new(device.TIMER3);
 
@@ -137,24 +155,6 @@ const APP: () = {
         // Feather pin D10
         let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
 
-        let switch = p1.p1_02.into_pullup_input().degrade();
-
-        let gpiote = Gpiote::new(device.GPIOTE);
-
-        // Enable interrupt from rfm d0 interrrupt pin.
-        gpiote
-            .channel0()
-            .input_pin(&rfm_irq)
-            .lo_to_hi()
-            .enable_interrupt();
-        defmt::trace!("enabled rfm irq interrupt");
-
-        gpiote
-            .channel1()
-            .input_pin(&switch)
-            .lo_to_hi()
-            .enable_interrupt();
-
         let config = RfmConfig {
             implicit_header_mode_on: false,
             bandwidth: Bandwidth::K125,
@@ -164,51 +164,21 @@ const APP: () = {
             spreading_factor: SpreadingFactor::Twelve,
         };
 
+        // Enable interrupt from rfm d0 interrrupt pin.
+        gpiote
+            .channel0()
+            .input_pin(&rfm_irq)
+            .lo_to_hi()
+            .enable_interrupt();
+
+        defmt::trace!("enabled rfm irq interrupt");
+
         let mut rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
+        initialize_rfm95(&mut rfm95, &mut spim);
         defmt::trace!("created rfm95");
-
-        rfm95
-            .set_frequency(&mut spim, Frequency::new::<hertz>(TX_FREQUENCY_HZ))
-            .unwrap();
-        defmt::trace!("set rfm95 freq");
-
-        // Enable tx done mask
-        rfm95
-            .read_update_write_packed_struct::<_, _, { IrqMasks::SIZE }>(
-                &mut spim,
-                |masks: &mut IrqMasks| {
-                    masks.tx_done = IrqMask::Enabled;
-                    masks.rx_done = IrqMask::Enabled;
-                },
-            )
-            .unwrap();
-
-        // Enable high power
-        rfm95
-            .read_update_write_packed_struct::<_, _, { PaConfig::SIZE }>(
-                &mut spim,
-                |config: &mut PaConfig| {
-                    config.pa_select = PaSelect::PaBoost;
-                },
-            )
-            .unwrap();
-
-        // Enable low data rate and agc
-        rfm95
-            .read_update_write_packed_struct::<_, _, { ModemConfig3::SIZE }>(
-                &mut spim,
-                |config: &mut ModemConfig3| {
-                    //config.agc = AGC::On;
-                    config.low_data_rate_optimize = LowDataRateOptimize::On;
-                },
-            )
-            .unwrap();
 
         ctx.spawn.tx_data().unwrap();
 
-        defmt::trace!("created late resources");
-
-        //device.QSPI.psel.sck = p0.p0_20;
         init::LateResources {
             ppm_correction: None,
             rf_correction: None,
@@ -444,6 +414,70 @@ const APP: () = {
     }
 };
 
+fn initialize_rfm95(
+    rfm95: &mut RFM95<
+        Spim<SPIM0>,
+        LoRaMode,
+        Pin<Output<PushPull>>,
+        Pin<Output<PushPull>>,
+        Timer<TIMER3>,
+    >,
+    spim: &mut Spim<SPIM0>,
+) {
+    rfm95.init(spim).unwrap();
+    rfm95
+        .set_frequency(spim, Frequency::new::<hertz>(TX_FREQUENCY_HZ))
+        .unwrap();
+    defmt::trace!("set rfm95 freq");
+    rfm95
+        .read_update_write_packed_struct::<_, _, { IrqMasks::SIZE }>(
+            spim,
+            |masks: &mut IrqMasks| {
+                masks.tx_done = IrqMask::Enabled;
+                masks.rx_done = IrqMask::Enabled;
+            },
+        )
+        .unwrap();
+    rfm95
+        .read_update_write_packed_struct::<_, _, { PaConfig::SIZE }>(
+            spim,
+            |config: &mut PaConfig| {
+                config.pa_select = PaSelect::PaBoost;
+            },
+        )
+        .unwrap();
+    rfm95
+        .read_update_write_packed_struct::<_, _, { ModemConfig3::SIZE }>(
+            spim,
+            |config: &mut ModemConfig3| {
+                //config.agc = AGC::On;
+                config.low_data_rate_optimize = LowDataRateOptimize::On;
+            },
+        )
+        .unwrap();
+}
+
+fn create_spim(
+    spim0: SPIM0,
+    mosi_pin: Pin<Disconnected>,
+    miso_pin: Pin<Disconnected>,
+    sck_pin: Pin<Disconnected>,
+) -> Spim<SPIM0> {
+    let mosi_pin = mosi_pin.into_push_pull_output(Level::High);
+    let miso_pin = miso_pin.into_floating_input();
+    let sck_pin = sck_pin.into_push_pull_output(Level::High);
+    let spim_pins = SpimPins {
+        sck: sck_pin,
+        mosi: Some(mosi_pin),
+        miso: Some(miso_pin),
+    };
+    let mode = SpimMode {
+        polarity: Polarity::IdleLow,
+        phase: Phase::CaptureOnFirstTransition,
+    };
+    Spim::new(spim0, spim_pins, SpimFrequency::K500, mode, 0xFF)
+}
+
 fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
     if led.is_set_high().unwrap() {
         led.set_low().unwrap();
@@ -468,23 +502,6 @@ fn configure_systimer(core: &mut rtic::Peripherals) {
 //    Twim::new(twim0, twim_pins, FREQUENCY_A::K100)
 //}
 //
-//fn create_spim0(p0: &mut Parts, spim0: SPIM0) -> Spim<SPIM0> {
-//    let mosi_pin = p0.p0_13.into_push_pull_output(Level::High);
-//    let miso_pin = p0.p0_12.into_floating_input();
-//    let sck_pin = p0.p0_15.into_push_pull_output(Level::High);
-//
-//    let spim_pins = SpimPins {
-//        sck: sck_pin.degrade(),
-//        mosi: Some(mosi_pin.degrade()),
-//        miso: Some(miso_pin.degrade())
-//    };
-//    let mode = SpimMode{
-//        polarity: Polarity::IdleLow,
-//        phase: Phase::CaptureOnFirstTransition
-//
-//    };
-//    Spim::new(spim0, spim_pins, SpimFrequency::K500, mode, 0x00)
-//}
 fn create_bmp280(twim: &mut Twim<TWIM0>) -> BMP280<Twim<TWIM0>, ModeNormal> {
     BMP280::new(
         twim,
