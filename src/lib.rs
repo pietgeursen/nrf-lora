@@ -1,6 +1,8 @@
 #![no_std]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+pub const TX_FREQUENCY_HZ: u32 = 915_000_000;
+pub mod rfm_statemachine;
+//use core::sync::atomic::{AtomicUsize, Ordering};
 
 // pick a panicking behavior
 //use panic_halt as _; // you can put a breakpoint on `rust_begin_unwind` to catch panics

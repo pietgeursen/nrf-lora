@@ -23,12 +23,13 @@ panic-probe = { version = "0.1.0"}
 rfm95-rs = { path = "../lora/rfm95c/", features = ["defmt-info"] }
 defmt = "0.1.3"
 defmt-rtt = "0.1.0"
+smlang = "0.3.5"
 
 [features]
 # set logging levels here
 default = [
-  #"defmt-default",
-  #"rfm95-rs/defmt-trace",
+  "defmt-default",
+  "rfm95-rs/defmt-trace",
 ]
 
 # do NOT modify these features
