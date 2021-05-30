@@ -1,3 +1,4 @@
+use crate::TX_FREQUENCY_HZ;
 use nrf52840_hal::gpio::{Output, Pin, PushPull};
 use nrf52840_hal::pac::{SPIM0, TIMER3};
 use nrf52840_hal::timer::OneShot;
@@ -5,12 +6,12 @@ use nrf52840_hal::Spim;
 use nrf52840_hal::Timer;
 use rfm95_rs::{
     lora::{
-        irq_masks::{IrqMask, IrqMasks},
         dio_mapping::*,
         fei::*,
         frequency_rf::*,
         irq_flags::IrqFlags,
-        modem_config1::{ModemConfig1},
+        irq_masks::{IrqMask, IrqMasks},
+        modem_config1::ModemConfig1,
         modem_config3::{LowDataRateOptimize, ModemConfig3},
         op_mode::Mode,
         pa_config::{PaConfig, PaSelect},
@@ -19,7 +20,6 @@ use rfm95_rs::{
     LoRaMode, RFM95,
 };
 use smlang::statemachine;
-use crate::TX_FREQUENCY_HZ;
 
 pub struct Context {
     pub rfm95: RFM95<
@@ -46,7 +46,6 @@ statemachine! {
 }
 
 impl StateMachineContext for Context {
-
     fn initialize(&mut self, ctx: &mut TempContext) -> () {
         defmt::trace!("start init");
         self.rfm95.init(ctx.spim).unwrap();
@@ -82,7 +81,6 @@ impl StateMachineContext for Context {
                 },
             )
             .unwrap();
-
     }
     fn start_transmission(&mut self, ctx: &mut TempContext) -> () {
         defmt::trace!("tx_data");
@@ -203,5 +201,3 @@ impl StateMachineContext for Context {
         irq_flags.rx_done && !irq_flags.payload_crc_error
     }
 }
-
-

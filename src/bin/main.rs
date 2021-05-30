@@ -2,7 +2,7 @@
 #![no_main]
 
 use nrf52840_hal::gpio::{Disconnected, Level, Output, Pin, PushPull};
-use nrf52840_hal::pac::{DWT, SPIM0};
+use nrf52840_hal::pac::SPIM0;
 use nrf52840_hal::prelude::*;
 use nrf52840_hal::spim::{
     Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
@@ -22,11 +22,7 @@ use rfm95_rs::{
 };
 use rtic::app;
 
-use rtic::cyccnt::U32Ext as _;
-const PERIOD: u32 = 128_000_000;
-
-
-#[app(device = nrf52840_hal::pac, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
+#[app(device = nrf52840_hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
         status_led: Pin<Output<PushPull>>,
@@ -47,13 +43,8 @@ const APP: () = {
     fn init(ctx: init::Context) -> init::LateResources {
         // Cortex-M peripherals
         defmt::info!("init");
-        let mut core = ctx.core;
-
         // Device specific peripherals
         let device: nrf52840_hal::pac::Peripherals = ctx.device;
-        // Initialize (enable) the monotonic timer (CYCCNT)
-        defmt::trace!("configure sys timer");
-        configure_systimer(&mut core);
 
         let p0 = Parts0::new(device.P0);
         let p1 = Parts1::new(device.P1);
@@ -112,10 +103,10 @@ const APP: () = {
         };
         let mut statemachine = StateMachine::new(context);
 
-        let mut sm_ctx = TempContext {
-            spim: &mut spim,
-        };
-        statemachine.process_event(&mut sm_ctx, Events::Initialize).unwrap();
+        let mut sm_ctx = TempContext { spim: &mut spim };
+        statemachine
+            .process_event(&mut sm_ctx, Events::Initialize)
+            .unwrap();
 
         ctx.spawn.tx_data().unwrap();
 
@@ -203,7 +194,7 @@ const APP: () = {
         ctx.spawn.rx_data().unwrap();
     }
 
-    #[task(schedule=[tx_data], resources=[spim, statemachine, status_led], spawn=[tx_data])]
+    #[task(resources=[spim, statemachine, status_led], spawn=[tx_data])]
     fn rx_complete(ctx: rx_complete::Context) {
         let mut sm_ctx = TempContext {
             spim: ctx.resources.spim,
@@ -216,13 +207,9 @@ const APP: () = {
         if result.is_ok() {
             toggle_status_led(ctx.resources.status_led);
 
-            ctx.schedule
-                .tx_data(ctx.scheduled + PERIOD.cycles())
-                .unwrap();
+            ctx.spawn.tx_data().unwrap();
         }
     }
-
-
 
     // RTIC requires that unused interrupts are declared in an extern block when
     // using software tasks; these free interrupts will be used to dispatch the
@@ -259,10 +246,4 @@ fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
     } else {
         led.set_high().unwrap();
     }
-}
-
-fn configure_systimer(core: &mut rtic::Peripherals) {
-    core.DCB.enable_trace();
-    DWT::unlock();
-    core.DWT.enable_cycle_counter();
 }
