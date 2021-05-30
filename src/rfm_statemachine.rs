@@ -1,4 +1,3 @@
-use crate::TX_FREQUENCY_HZ;
 use nrf52840_hal::gpio::{Output, Pin, PushPull};
 use nrf52840_hal::pac::{SPIM0, TIMER3};
 use nrf52840_hal::timer::OneShot;
@@ -21,6 +20,7 @@ use rfm95_rs::{
 };
 use smlang::statemachine;
 
+pub const TX_FREQUENCY_HZ: u32 = 915_000_000;
 pub struct Context {
     pub rfm95: RFM95<
         Spim<SPIM0>,

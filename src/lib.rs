@@ -1,7 +1,7 @@
 #![no_std]
 
-pub const TX_FREQUENCY_HZ: u32 = 915_000_000;
 pub mod rfm_statemachine;
+pub mod ble;
 //use core::sync::atomic::{AtomicUsize, Ordering};
 
 // pick a panicking behavior
