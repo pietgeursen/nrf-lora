@@ -5,12 +5,15 @@ use nrf52840_hal::Spim;
 use nrf52840_hal::Timer;
 use rfm95_rs::{
     lora::{
+        irq_masks::{IrqMask, IrqMasks},
         dio_mapping::*,
         fei::*,
         frequency_rf::*,
         irq_flags::IrqFlags,
         modem_config1::{ModemConfig1},
+        modem_config3::{LowDataRateOptimize, ModemConfig3},
         op_mode::Mode,
+        pa_config::{PaConfig, PaSelect},
     },
     size_bytes::SizeBytes,
     LoRaMode, RFM95,
@@ -35,13 +38,52 @@ pub struct TempContext<'a> {
 }
 
 statemachine! {
-    *(&mut TempContext) Idle + StartTransmitting / start_transmission = Transmitting,
+    *(&mut TempContext) Uninit + Initialize / initialize = Idle,
+    Idle + StartTransmitting / start_transmission = Transmitting,
     Transmitting + TxCompleted / stop_transmitting = TxCompleted,
     TxCompleted + StartReceiving / start_receiving = Receiving,
     Receiving + RxCompleted [guard_stop_receiving] / stop_receiving = Idle,
 }
 
 impl StateMachineContext for Context {
+
+    fn initialize(&mut self, ctx: &mut TempContext) -> () {
+        defmt::trace!("start init");
+        self.rfm95.init(ctx.spim).unwrap();
+        defmt::trace!("init done");
+
+        self.rfm95
+            .set_frequency(ctx.spim, Frequency::new::<hertz>(TX_FREQUENCY_HZ))
+            .unwrap();
+        defmt::trace!("set rfm95 freq");
+        self.rfm95
+            .read_update_write_packed_struct::<_, _, { IrqMasks::SIZE }>(
+                ctx.spim,
+                |masks: &mut IrqMasks| {
+                    masks.tx_done = IrqMask::Enabled;
+                    masks.rx_done = IrqMask::Enabled;
+                },
+            )
+            .unwrap();
+        self.rfm95
+            .read_update_write_packed_struct::<_, _, { PaConfig::SIZE }>(
+                ctx.spim,
+                |config: &mut PaConfig| {
+                    config.pa_select = PaSelect::PaBoost;
+                },
+            )
+            .unwrap();
+        self.rfm95
+            .read_update_write_packed_struct::<_, _, { ModemConfig3::SIZE }>(
+                ctx.spim,
+                |config: &mut ModemConfig3| {
+                    //config.agc = AGC::On;
+                    config.low_data_rate_optimize = LowDataRateOptimize::On;
+                },
+            )
+            .unwrap();
+
+    }
     fn start_transmission(&mut self, ctx: &mut TempContext) -> () {
         defmt::trace!("tx_data");
         // clear the tx interrupt in the rfm95

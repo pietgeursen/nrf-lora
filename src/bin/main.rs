@@ -2,7 +2,7 @@
 #![no_main]
 
 use nrf52840_hal::gpio::{Disconnected, Level, Output, Pin, PushPull};
-use nrf52840_hal::pac::{DWT, SPIM0, TIMER3};
+use nrf52840_hal::pac::{DWT, SPIM0};
 use nrf52840_hal::prelude::*;
 use nrf52840_hal::spim::{
     Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
@@ -11,21 +11,14 @@ use nrf52840_hal::Spim;
 use nrf52840_hal::Timer;
 use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote::*};
 use nrf_bamboo_rs as _;
-use nrf_bamboo_rs::TX_FREQUENCY_HZ;
 use nrf_bamboo_rs::rfm_statemachine::*;
 
 use rfm95_rs::{
     lora::{
-        fei::*,
-        frequency_rf::*,
-        irq_masks::{IrqMask, IrqMasks},
         modem_config1::{Bandwidth, CodingRate},
         modem_config2::SpreadingFactor,
-        modem_config3::{LowDataRateOptimize, ModemConfig3},
-        pa_config::{PaConfig, PaSelect},
     },
-    size_bytes::SizeBytes,
-    Config as RfmConfig, LoRaMode, RFM95,
+    Config as RfmConfig, RFM95,
 };
 use rtic::app;
 
@@ -110,25 +103,68 @@ const APP: () = {
 
         defmt::trace!("enabled rfm irq interrupt");
 
-        let mut rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
-        defmt::trace!("created rfm95");
-        initialize_rfm95(&mut rfm95, &mut spim);
-        defmt::trace!("intialized rfm95");
-
-        ctx.spawn.tx_data().unwrap();
+        let rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
 
         let context = Context {
             rfm95,
             ppm_correction: None,
             rf_correction: None,
         };
-        let statemachine = StateMachine::new(context);
+        let mut statemachine = StateMachine::new(context);
+
+        let mut sm_ctx = TempContext {
+            spim: &mut spim,
+        };
+        statemachine.process_event(&mut sm_ctx, Events::Initialize).unwrap();
+
+        ctx.spawn.tx_data().unwrap();
+
         init::LateResources {
             statemachine,
             status_led,
             gpiote,
             spim,
         }
+    }
+
+    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
+    fn on_gpiote(ctx: on_gpiote::Context) {
+        if ctx.resources.gpiote.channel0().is_event_triggered() {
+            defmt::trace!("Interrupt from channel 0 event");
+            ctx.spawn.handle_rfm_interrupt().unwrap();
+        }
+        if ctx.resources.gpiote.channel1().is_event_triggered() {
+            defmt::trace!("Interrupt from channel 1 event");
+            ctx.spawn.handle_retry_interrupt().unwrap();
+        }
+
+        if ctx.resources.gpiote.port().is_event_triggered() {
+            defmt::trace!("Interrupt from port event");
+        }
+        // Reset all events
+        ctx.resources.gpiote.reset_events();
+    }
+
+    #[task(resources=[statemachine], spawn=[tx_complete, rx_complete])]
+    fn handle_rfm_interrupt(ctx: handle_rfm_interrupt::Context) {
+        defmt::trace!("handle_rfm_interrupt");
+        match ctx.resources.statemachine.state() {
+            States::Transmitting => {
+                ctx.spawn.tx_complete().unwrap();
+            }
+            States::Receiving => {
+                ctx.spawn.rx_complete().unwrap();
+            }
+            _ => {
+                defmt::info!("in handle_rfm_interrupt with unexpected state")
+            }
+        }
+    }
+
+    #[task(resources=[], spawn=[tx_data])]
+    fn handle_retry_interrupt(_ctx: handle_retry_interrupt::Context) {
+        defmt::trace!("NOT handling_rfm_interrupt");
+        //ctx.spawn.tx_data().unwrap();
     }
 
     #[task(resources=[statemachine, spim], capacity=4)]
@@ -186,45 +222,7 @@ const APP: () = {
         }
     }
 
-    #[task(resources=[statemachine], spawn=[tx_complete, rx_complete])]
-    fn handle_rfm_interrupt(ctx: handle_rfm_interrupt::Context) {
-        defmt::trace!("handle_rfm_interrupt");
-        match ctx.resources.statemachine.state() {
-            States::Transmitting => {
-                ctx.spawn.tx_complete().unwrap();
-            }
-            States::Receiving => {
-                ctx.spawn.rx_complete().unwrap();
-            }
-            _ => {
-                defmt::info!("in handle_rfm_interrupt with unexpected state")
-            }
-        }
-    }
 
-    #[task(resources=[], spawn=[tx_data])]
-    fn handle_retry_interrupt(_ctx: handle_retry_interrupt::Context) {
-        defmt::trace!("NOT handling_rfm_interrupt");
-        //ctx.spawn.tx_data().unwrap();
-    }
-
-    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
-    fn on_gpiote(ctx: on_gpiote::Context) {
-        if ctx.resources.gpiote.channel0().is_event_triggered() {
-            defmt::trace!("Interrupt from channel 0 event");
-            ctx.spawn.handle_rfm_interrupt().unwrap();
-        }
-        if ctx.resources.gpiote.channel1().is_event_triggered() {
-            defmt::trace!("Interrupt from channel 1 event");
-            ctx.spawn.handle_retry_interrupt().unwrap();
-        }
-
-        if ctx.resources.gpiote.port().is_event_triggered() {
-            defmt::trace!("Interrupt from port event");
-        }
-        // Reset all events
-        ctx.resources.gpiote.reset_events();
-    }
 
     // RTIC requires that unused interrupts are declared in an extern block when
     // using software tasks; these free interrupts will be used to dispatch the
@@ -233,52 +231,6 @@ const APP: () = {
         fn I2S();
     }
 };
-
-fn initialize_rfm95(
-    rfm95: &mut RFM95<
-        Spim<SPIM0>,
-        LoRaMode,
-        Pin<Output<PushPull>>,
-        Pin<Output<PushPull>>,
-        Timer<TIMER3>,
-    >,
-    spim: &mut Spim<SPIM0>,
-) {
-    defmt::trace!("start init");
-    rfm95.init(spim).unwrap();
-    defmt::trace!("init done");
-
-    rfm95
-        .set_frequency(spim, Frequency::new::<hertz>(TX_FREQUENCY_HZ))
-        .unwrap();
-    defmt::trace!("set rfm95 freq");
-    rfm95
-        .read_update_write_packed_struct::<_, _, { IrqMasks::SIZE }>(
-            spim,
-            |masks: &mut IrqMasks| {
-                masks.tx_done = IrqMask::Enabled;
-                masks.rx_done = IrqMask::Enabled;
-            },
-        )
-        .unwrap();
-    rfm95
-        .read_update_write_packed_struct::<_, _, { PaConfig::SIZE }>(
-            spim,
-            |config: &mut PaConfig| {
-                config.pa_select = PaSelect::PaBoost;
-            },
-        )
-        .unwrap();
-    rfm95
-        .read_update_write_packed_struct::<_, _, { ModemConfig3::SIZE }>(
-            spim,
-            |config: &mut ModemConfig3| {
-                //config.agc = AGC::On;
-                config.low_data_rate_optimize = LowDataRateOptimize::On;
-            },
-        )
-        .unwrap();
-}
 
 fn create_spim(
     spim0: SPIM0,
