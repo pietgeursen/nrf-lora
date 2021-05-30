@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::mem;
 use nrf52840_hal::{
     gpio::{
         p0::Parts as Parts0, p1::Parts as Parts1, Disconnected, Input, Level, Output, Pin, PullUp,
@@ -16,6 +17,7 @@ use nrf52840_hal::{
 
 use nrf_bamboo_rs as _;
 use nrf_bamboo_rs::ble::*;
+use nrf_bamboo_rs::ble::Config as BleConfig;
 use nrf_bamboo_rs::rfm_statemachine::*;
 
 use rfm95_rs::{
@@ -41,7 +43,54 @@ const APP: () = {
 
     #[idle(resources=[])]
     fn idle(_ctx: idle::Context) -> ! {
-        configure_sd();
+        let ble_config = BleConfig{
+            gap_device_name: Some(ble_gap_cfg_device_name_t {
+                p_value: b"HelloRust" as *const u8 as _,
+                current_len: 9,
+                max_len: 9,
+                write_perm: unsafe { mem::zeroed() },
+                _bitfield_1: ble_gap_cfg_device_name_t::new_bitfield_1(
+                    BLE_GATTS_VLOC_STACK as u8,
+                ),
+            }),
+            ..Default::default()
+        };
+        configure_ble(&ble_config);
+
+        let mut adv_handle = BLE_GAP_ADV_SET_HANDLE_NOT_SET as u8;
+        
+        #[rustfmt::skip]
+        let mut adv_data = [
+            0x02, 0x01, BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE as u8,
+            0x03, 0x03, 0x09, 0x18,
+            0x0a, 0x09, b'H', b'e', b'l', b'l', b'o', b'R', b'u', b's', b't',
+        ];
+        #[rustfmt::skip]
+        let mut scan_data = [
+            0x03, 0x03, 0x09, 0x18,
+        ];
+
+        let gap_adv_data = ble_gap_adv_data_t{
+            adv_data: ble_data_t{p_data: adv_data.as_mut_ptr() , len: adv_data.len() as u16},
+            scan_rsp_data: ble_data_t{p_data: scan_data.as_mut_ptr(), len: scan_data.len() as u16} 
+        };
+
+        let mut gap_adv_params: ble_gap_adv_params_t = unsafe{mem::zeroed()};
+
+        gap_adv_params.properties.type_ = BLE_GAP_ADV_TYPE_CONNECTABLE_SCANNABLE_UNDIRECTED as u8;
+        gap_adv_params.primary_phy = BLE_GAP_PHY_AUTO as u8;
+        gap_adv_params.secondary_phy = BLE_GAP_PHY_AUTO as u8;
+        gap_adv_params.interval = 400;
+
+        let result = unsafe{sd_ble_gap_adv_set_configure(&mut adv_handle, &gap_adv_data, &gap_adv_params)};
+        if result != NRF_SUCCESS{
+            defmt::error!("adv set cfg result: {:?}", result);
+        }
+
+        let result = unsafe{sd_ble_gap_adv_start(adv_handle, 1)};
+        if result != NRF_SUCCESS{
+            defmt::error!("adv start result: {:?}", result);
+        }
         loop {
             //defmt::info!("idle");
             cortex_m::asm::wfi();
@@ -133,6 +182,7 @@ const APP: () = {
 
         defmt::trace!("Interrupt from rtc1");
     }
+
     #[task(binds = GPIOTE, resources = [gpiote, rfm_irq_pin, switch_pin], priority=3, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.port().is_event_triggered() {
