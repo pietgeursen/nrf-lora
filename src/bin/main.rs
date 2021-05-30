@@ -2,8 +2,9 @@
 #![no_main]
 
 use nrf52840_hal::gpio::{Disconnected, Level, Output, Pin, PushPull};
-use nrf52840_hal::pac::SPIM0;
+use nrf52840_hal::pac::{RTC1, SPIM0};
 use nrf52840_hal::prelude::*;
+use nrf52840_hal::rtc::{Rtc, RtcCompareReg, RtcInterrupt};
 use nrf52840_hal::spim::{
     Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
 };
@@ -12,6 +13,7 @@ use nrf52840_hal::Timer;
 use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote::*};
 use nrf_bamboo_rs as _;
 use nrf_bamboo_rs::rfm_statemachine::*;
+use nrf_softdevice_s140::*;
 
 use rfm95_rs::{
     lora::{
@@ -29,10 +31,12 @@ const APP: () = {
         gpiote: Gpiote,
         spim: Spim<SPIM0>,
         statemachine: StateMachine<Context>,
+        rtc1: Rtc<RTC1>,
     }
 
-    #[idle(resources=[spim])]
+    #[idle(resources=[])]
     fn idle(_ctx: idle::Context) -> ! {
+        configure_sd();
         loop {
             //defmt::info!("idle");
             cortex_m::asm::wfi();
@@ -85,7 +89,15 @@ const APP: () = {
             spreading_factor: SpreadingFactor::Twelve,
         };
 
+        let mut rtc1 = Rtc::new(device.RTC1, 0).unwrap();
+
+        rtc1.enable_counter();
+        rtc1.set_compare(RtcCompareReg::Compare0, 32768).unwrap();
+        rtc1.enable_interrupt(RtcInterrupt::Compare0, None);
+
         // Enable interrupt from rfm d0 interrrupt pin.
+        // TODO: these channel event for a pin consume more power when sleeping. Port events use
+        // less
         gpiote
             .channel0()
             .input_pin(&rfm_irq)
@@ -114,10 +126,18 @@ const APP: () = {
             statemachine,
             status_led,
             gpiote,
+            rtc1,
             spim,
         }
     }
 
+    #[task(binds = RTC1, resources = [rtc1], priority=2, spawn=[])]
+    fn on_rtc1(ctx: on_rtc1::Context) {
+        ctx.resources.rtc1.reset_event(RtcInterrupt::Compare0);
+        ctx.resources.rtc1.clear_counter();
+
+        defmt::trace!("Interrupt from rtc1");
+    }
     #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.channel0().is_event_triggered() {
@@ -246,4 +266,24 @@ fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
     } else {
         led.set_high().unwrap();
     }
+}
+
+fn configure_sd() {
+    let clock_config = nrf_clock_lf_cfg_t {
+        source: NRF_CLOCK_LF_SRC_RC as u8,
+        rc_ctiv: 20,
+        rc_temp_ctiv: 0,
+        accuracy: NRF_CLOCK_LF_ACCURACY_20_PPM as u8,
+    };
+    defmt::info!("enable sd");
+    let err_code = unsafe { sd_softdevice_enable(&clock_config, Some(nrf_fault_handler)) };
+    defmt::info!("soft device err code: {:?}", err_code);
+    let mut is_enabled = 0;
+    let err_code = unsafe { sd_softdevice_is_enabled(&mut is_enabled) };
+    defmt::info!("soft device is_enabled: {:?}", is_enabled);
+    defmt::info!("soft device err code: {:?}", err_code);
+}
+
+extern "C" fn nrf_fault_handler(_id: u32, _pc: u32, _info: u32) {
+    defmt::error!("nrf fault handler");
 }
