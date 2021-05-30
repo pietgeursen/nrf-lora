@@ -35,7 +35,7 @@ const APP: () = {
     fn idle(_ctx: idle::Context) -> ! {
         loop {
             //defmt::info!("idle");
-            //cortex_m::asm::wfi();
+            cortex_m::asm::wfi();
         }
     }
 
