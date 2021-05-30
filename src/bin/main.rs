@@ -1,19 +1,19 @@
 #![no_std]
 #![no_main]
 
-use nrf52840_hal::gpio::{Disconnected, Level, Output, Pin, PushPull};
-use nrf52840_hal::pac::{RTC1, SPIM0};
-use nrf52840_hal::prelude::*;
-use nrf52840_hal::rtc::{Rtc, RtcCompareReg, RtcInterrupt};
-use nrf52840_hal::spim::{
-    Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity,
+use nrf52840_hal::{
+    gpio::{p0::Parts as Parts0, p1::Parts as Parts1, Disconnected, Level, Output, Pin, PushPull},
+    gpiote::*,
+    pac::{RTC1, SPIM0},
+    prelude::*,
+    rtc::{Rtc, RtcCompareReg, RtcInterrupt},
+    spim::{Frequency as SpimFrequency, Mode as SpimMode, Phase, Pins as SpimPins, Polarity},
+    Spim, Timer,
 };
-use nrf52840_hal::Spim;
-use nrf52840_hal::Timer;
-use nrf52840_hal::{gpio::p0::Parts as Parts0, gpio::p1::Parts as Parts1, gpiote::*};
+
 use nrf_bamboo_rs as _;
-use nrf_bamboo_rs::rfm_statemachine::*;
 use nrf_bamboo_rs::ble::*;
+use nrf_bamboo_rs::rfm_statemachine::*;
 
 use rfm95_rs::{
     lora::{
@@ -267,5 +267,3 @@ fn toggle_status_led(led: &mut Pin<Output<PushPull>>) {
         led.set_high().unwrap();
     }
 }
-
-
