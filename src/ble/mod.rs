@@ -49,7 +49,7 @@ pub struct Config {
     pub gatts_attr_tab_size: Option<ble_gatts_cfg_attr_tab_size_t>,
 }
 
-pub fn configure_ble(config: &Config) {
+pub fn configure_ble(config: &Config, adv_data: &mut[u8], scan_data: &mut [u8]) {
     configure_sd();
 
     let app_ram_base = get_app_ram_base();
@@ -233,18 +233,6 @@ pub fn configure_ble(config: &Config) {
     }
 
     let mut adv_handle = BLE_GAP_ADV_SET_HANDLE_NOT_SET as u8;
-
-    #[rustfmt::skip]
-        let mut adv_data = [
-            0x02, 0x01, BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE as u8,
-            0x03, 0x03, 0x09, 0x18,
-            0x0a, 0x09, b'H', b'e', b'l', b'l', b'o', b'R', b'u', b's', b't',
-        ];
-    #[rustfmt::skip]
-        let mut scan_data = [
-            0x03, 0x03, 0x09, 0x18,
-        ];
-
     let gap_adv_data = ble_gap_adv_data_t {
         adv_data: ble_data_t {
             p_data: adv_data.as_mut_ptr(),

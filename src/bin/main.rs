@@ -57,39 +57,50 @@ const APP: () = {
             ..Default::default()
         };
 
-        configure_ble(&ble_config);
+        #[rustfmt::skip]
+        let mut adv_data = [
+            0x02, 0x01, BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE as u8,
+            0x03, 0x03, 0x09, 0x18,
+            0x0a, 0x09, b'H', b'e', b'l', b'l', b'o', b'R', b'u', b's', b't',
+        ];
+        #[rustfmt::skip]
+        let mut scan_data = [
+            0x03, 0x03, 0x09, 0x18,
+        ];
+
+        configure_ble(&ble_config, &mut adv_data, &mut scan_data);
 
         loop {
-//            loop {
-//                let mut evt: ble_evt_t = unsafe { mem::zeroed() };
-//                let mut len = mem::size_of::<ble_evt_t>() as _;
-//                let evt_ptr: *mut ble_evt_t = &mut evt;
-//                let result = unsafe { sd_ble_evt_get(evt_ptr.cast(), &mut len) };
-//                if result == NRF_ERROR_NOT_FOUND {
-//                    //defmt::trace!("no events from ble stack");
-//                    break;
-//                }
-//
-//                if result == NRF_SUCCESS {
-//                    defmt::trace!("event ready from ble stack with len: {:?}", len);
-//                    defmt::trace!("evt header id: {:?}", evt.header.evt_id);
-//                    defmt::trace!("evt header len: {:?}", evt.header.evt_len);
-//
-//                    match evt.header.evt_id as u32 {
-//                        BLE_GAP_EVTS_BLE_GAP_EVT_TIMEOUT => {
-//                            defmt::trace!("event timeout");
-//                        }
-//                        BLE_GAP_EVTS_BLE_GAP_EVT_ADV_SET_TERMINATED => {
-//                            defmt::info!("advertising timed out and terminated");
-//                        }
-//                        x => {
-//                            defmt::warn!("unhandled event num was {:?}", x);
-//                        }
-//                    };
-//                    break;
-//                }
-//                defmt::error!("sd ble evt error: {:?}", result);
-//            }
+            loop {
+                let mut evt: ble_evt_t = unsafe { mem::zeroed() };
+                let mut len = mem::size_of::<ble_evt_t>() as _;
+                let evt_ptr: *mut ble_evt_t = &mut evt;
+                let result = unsafe { sd_ble_evt_get(evt_ptr.cast(), &mut len) };
+                if result == NRF_ERROR_NOT_FOUND {
+                    //defmt::trace!("no events from ble stack");
+                    break;
+                }
+
+                if result == NRF_SUCCESS {
+                    defmt::trace!("event ready from ble stack with len: {:?}", len);
+                    defmt::trace!("evt header id: {:?}", evt.header.evt_id);
+                    defmt::trace!("evt header len: {:?}", evt.header.evt_len);
+
+                    match evt.header.evt_id as u32 {
+                        BLE_GAP_EVTS_BLE_GAP_EVT_TIMEOUT => {
+                            defmt::trace!("event timeout");
+                        }
+                        BLE_GAP_EVTS_BLE_GAP_EVT_ADV_SET_TERMINATED => {
+                            defmt::info!("advertising timed out and terminated");
+                        }
+                        x => {
+                            defmt::warn!("unhandled event num was {:?}", x);
+                        }
+                    };
+                    break;
+                }
+                defmt::error!("sd ble evt error: {:?}", result);
+            }
             cortex_m::asm::wfi();
         }
     }
