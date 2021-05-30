@@ -2,7 +2,10 @@
 #![no_main]
 
 use nrf52840_hal::{
-    gpio::{p0::Parts as Parts0, p1::Parts as Parts1, Disconnected, Level, Output, Pin, PushPull},
+    gpio::{
+        p0::Parts as Parts0, p1::Parts as Parts1, Disconnected, Input, Level, Output, Pin, PullUp,
+        PushPull,
+    },
     gpiote::*,
     pac::{RTC1, SPIM0},
     prelude::*,
@@ -32,6 +35,8 @@ const APP: () = {
         spim: Spim<SPIM0>,
         statemachine: StateMachine<Context>,
         rtc1: Rtc<RTC1>,
+        rfm_irq_pin: Pin<Input<PullUp>>,
+        switch_pin: Pin<Input<PullUp>>,
     }
 
     #[idle(resources=[])]
@@ -57,12 +62,7 @@ const APP: () = {
 
         let gpiote = Gpiote::new(device.GPIOTE);
 
-        let switch = p1.p1_02.into_pullup_input().degrade();
-        gpiote
-            .channel1()
-            .input_pin(&switch)
-            .lo_to_hi()
-            .enable_interrupt();
+        let switch_pin = p1.p1_02.into_pullup_input().degrade();
 
         let mut spim = create_spim(
             device.SPIM0,
@@ -76,7 +76,7 @@ const APP: () = {
         // Feather pin D12
         let spi_cs = p0.p0_08.into_push_pull_output(Level::High).degrade();
         // Feather pin D11
-        let rfm_irq = p0.p0_06.into_pullup_input().degrade();
+        let rfm_irq_pin = p0.p0_06.into_pullup_input().degrade();
         // Feather pin D10
         let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
 
@@ -95,14 +95,13 @@ const APP: () = {
         rtc1.set_compare(RtcCompareReg::Compare0, 32768).unwrap();
         rtc1.enable_interrupt(RtcInterrupt::Compare0, None);
 
-        // Enable interrupt from rfm d0 interrrupt pin.
-        // TODO: these channel event for a pin consume more power when sleeping. Port events use
-        // less
-        gpiote
-            .channel0()
-            .input_pin(&rfm_irq)
-            .lo_to_hi()
-            .enable_interrupt();
+        // Enable interrupt from rfm d0 interrupt pin.
+        let gpiote_port = gpiote.port();
+
+        gpiote_port.enable_interrupt();
+
+        gpiote_port.input_pin(&rfm_irq_pin).high();
+        gpiote_port.input_pin(&switch_pin).low();
 
         defmt::trace!("enabled rfm irq interrupt");
 
@@ -124,7 +123,9 @@ const APP: () = {
 
         init::LateResources {
             statemachine,
+            rfm_irq_pin,
             status_led,
+            switch_pin,
             gpiote,
             rtc1,
             spim,
@@ -138,19 +139,20 @@ const APP: () = {
 
         defmt::trace!("Interrupt from rtc1");
     }
-    #[task(binds = GPIOTE, resources = [gpiote], priority=2, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
+    #[task(binds = GPIOTE, resources = [gpiote, rfm_irq_pin, switch_pin], priority=3, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
-        if ctx.resources.gpiote.channel0().is_event_triggered() {
-            defmt::trace!("Interrupt from channel 0 event");
-            ctx.spawn.handle_rfm_interrupt().unwrap();
-        }
-        if ctx.resources.gpiote.channel1().is_event_triggered() {
-            defmt::trace!("Interrupt from channel 1 event");
-            ctx.spawn.handle_retry_interrupt().unwrap();
-        }
-
         if ctx.resources.gpiote.port().is_event_triggered() {
             defmt::trace!("Interrupt from port event");
+
+            if ctx.resources.rfm_irq_pin.is_high().unwrap() {
+                defmt::trace!("Interrupt from port event, irq pin high");
+                ctx.spawn.handle_rfm_interrupt().unwrap();
+            }
+
+            if ctx.resources.switch_pin.is_low().unwrap() {
+                defmt::trace!("Interrupt from port event, switch pin low");
+                ctx.spawn.handle_retry_interrupt().unwrap();
+            }
         }
         // Reset all events
         ctx.resources.gpiote.reset_events();
