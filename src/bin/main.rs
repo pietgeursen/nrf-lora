@@ -50,7 +50,6 @@ const APP: () = {
 
     #[init(spawn=[tx_data])]
     fn init(ctx: init::Context) -> init::LateResources {
-        // Cortex-M peripherals
         defmt::info!("init");
         // Device specific peripherals
         let device: nrf52840_hal::pac::Peripherals = ctx.device;
@@ -59,19 +58,7 @@ const APP: () = {
         let p1 = Parts1::new(device.P1);
 
         let status_led = p1.p1_10.into_push_pull_output(Level::Low).degrade();
-
-        let gpiote = Gpiote::new(device.GPIOTE);
-
         let switch_pin = p1.p1_02.into_pullup_input().degrade();
-
-        let mut spim = create_spim(
-            device.SPIM0,
-            p0.p0_13.degrade(),
-            p0.p0_15.degrade(),
-            p0.p0_14.degrade(),
-        );
-
-        let delay_timer = Timer::new(device.TIMER3);
 
         // Feather pin D12
         let spi_cs = p0.p0_08.into_push_pull_output(Level::High).degrade();
@@ -80,6 +67,20 @@ const APP: () = {
         // Feather pin D10
         let rfm_reset = p0.p0_27.into_push_pull_output(Level::High).degrade();
 
+        // Configure RTC1 to trigger an interrupt after 1s.
+        let mut rtc1 = Rtc::new(device.RTC1, 0).unwrap();
+        rtc1.enable_counter();
+        rtc1.set_compare(RtcCompareReg::Compare0, 32768).unwrap();
+        rtc1.enable_interrupt(RtcInterrupt::Compare0, None);
+
+        // Enable interrupt from rfm d0 interrupt pin and use switch pin.
+        let gpiote = Gpiote::new(device.GPIOTE);
+        let gpiote_port = gpiote.port();
+        gpiote_port.input_pin(&rfm_irq_pin).high();
+        gpiote_port.input_pin(&switch_pin).low();
+        gpiote_port.enable_interrupt();
+
+        // Configure and create the rfm95
         let config = RfmConfig {
             implicit_header_mode_on: false,
             bandwidth: Bandwidth::K125,
@@ -88,25 +89,18 @@ const APP: () = {
             rx_payload_crc_on: true,
             spreading_factor: SpreadingFactor::Twelve,
         };
+        let delay_timer = Timer::new(device.TIMER3);
 
-        let mut rtc1 = Rtc::new(device.RTC1, 0).unwrap();
-
-        rtc1.enable_counter();
-        rtc1.set_compare(RtcCompareReg::Compare0, 32768).unwrap();
-        rtc1.enable_interrupt(RtcInterrupt::Compare0, None);
-
-        // Enable interrupt from rfm d0 interrupt pin.
-        let gpiote_port = gpiote.port();
-
-        gpiote_port.enable_interrupt();
-
-        gpiote_port.input_pin(&rfm_irq_pin).high();
-        gpiote_port.input_pin(&switch_pin).low();
-
-        defmt::trace!("enabled rfm irq interrupt");
+        let mut spim = create_spim(
+            device.SPIM0,
+            p0.p0_13.degrade(),
+            p0.p0_15.degrade(),
+            p0.p0_14.degrade(),
+        );
 
         let rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
 
+        // Configure and create the statemachine for the rfm95
         let context = Context {
             rfm95,
             ppm_correction: None,
