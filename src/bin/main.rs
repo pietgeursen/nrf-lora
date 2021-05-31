@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use nrf52840_hal as hal;
 use nrf52840_hal::{
     gpio::{
         p0::Parts as Parts0, p1::Parts as Parts1, Disconnected, Input, Level, Output, Pin, PullUp,
@@ -15,6 +16,7 @@ use nrf52840_hal::{
 };
 
 use nrf_bamboo_rs as _;
+use nrf_bamboo_rs::ble::attrs;
 use nrf_bamboo_rs::rfm_statemachine::*;
 
 use rfm95_rs::{
@@ -26,6 +28,33 @@ use rfm95_rs::{
 };
 use rtic::app;
 
+use bbqueue::Consumer;
+use core::sync::atomic::{compiler_fence, Ordering};
+use rubble::{
+    config::Config,
+    l2cap::{BleChannelMap, L2CAPState},
+    link::{
+        ad_structure::AdStructure,
+        queue::{PacketQueue, SimpleQueue},
+        LinkLayer, Responder, MIN_PDU_BUF,
+    },
+    security::NoSecurity,
+    time::{Duration, Timer as RubbleTimer},
+};
+use rubble_nrf5x::{
+    radio::{BleRadio, PacketBuffer},
+    timer::BleTimer,
+    utils::get_device_address,
+};
+
+pub enum AppConfig {}
+
+impl Config for AppConfig {
+    type Timer = BleTimer<hal::pac::TIMER0>;
+    type Transmitter = BleRadio;
+    type ChannelMapper = BleChannelMap<attrs::LoraMessagingAttrs, NoSecurity>;
+    type PacketQueue = &'static mut SimpleQueue;
+}
 #[app(device = nrf52840_hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
@@ -36,24 +65,88 @@ const APP: () = {
         rtc1: Rtc<RTC1>,
         rfm_irq_pin: Pin<Input<PullUp>>,
         switch_pin: Pin<Input<PullUp>>,
+
+        // Below is stuff for rubble:
+        #[init([0; MIN_PDU_BUF])]
+        ble_tx_buf: PacketBuffer,
+        #[init([0; MIN_PDU_BUF])]
+        ble_rx_buf: PacketBuffer,
+        #[init(SimpleQueue::new())]
+        tx_queue: SimpleQueue,
+        #[init(SimpleQueue::new())]
+        rx_queue: SimpleQueue,
+        ble_ll: LinkLayer<AppConfig>,
+        ble_r: Responder<AppConfig>,
+        radio: BleRadio,
     }
 
     #[idle(resources=[])]
     fn idle(_ctx: idle::Context) -> ! {
         loop {
+            // Work around https://github.com/rust-lang/rust/issues/28728
+            compiler_fence(Ordering::SeqCst);
             //defmt::info!("idle");
             cortex_m::asm::wfi();
         }
     }
 
-    #[init(spawn=[tx_data])]
+    #[init(spawn=[tx_data], resources =[ble_tx_buf, ble_rx_buf, tx_queue, rx_queue])]
     fn init(ctx: init::Context) -> init::LateResources {
         defmt::info!("init");
+
         // Device specific peripherals
         let device: nrf52840_hal::pac::Peripherals = ctx.device;
 
         let p0 = Parts0::new(device.P0);
         let p1 = Parts1::new(device.P1);
+
+        // On reset, the internal high frequency clock is already used, but we
+        // also need to switch to the external HF oscillator. This is needed
+        // for Bluetooth to work.
+        let _clocks = hal::clocks::Clocks::new(device.CLOCK).enable_ext_hfosc();
+
+        let ble_timer = BleTimer::init(device.TIMER0);
+
+        // Determine device address
+        let device_address = get_device_address();
+
+        let mut radio = BleRadio::new(
+            device.RADIO,
+            &device.FICR,
+            ctx.resources.ble_tx_buf,
+            ctx.resources.ble_rx_buf,
+        );
+
+        // Create TX/RX queues
+        let (tx, tx_cons) = ctx.resources.tx_queue.split();
+        let (rx_prod, rx) = ctx.resources.rx_queue.split();
+
+        // Create the actual BLE stack objects
+        let mut ble_ll = LinkLayer::<AppConfig>::new(device_address, ble_timer);
+
+        // Feather pin D13
+        let other_status_led = p1.p1_09.into_push_pull_output(Level::Low).degrade();
+
+        let ble_r = Responder::new(
+            tx,
+            rx,
+            L2CAPState::new(BleChannelMap::with_attributes(attrs::LoraMessagingAttrs::new(
+                other_status_led,
+            ))),
+        );
+
+        // Send advertisement and set up regular interrupt
+        let next_update = ble_ll
+            .start_advertise(
+                Duration::from_millis(200),
+                &[AdStructure::CompleteLocalName("Lora Messaging Service")],
+                &mut radio,
+                tx_cons,
+                rx_prod,
+            )
+            .unwrap();
+
+        ble_ll.timer().configure_interrupt(next_update);
 
         let status_led = p1.p1_10.into_push_pull_output(Level::Low).degrade();
         let switch_pin = p1.p1_02.into_pullup_input().degrade();
@@ -114,6 +207,9 @@ const APP: () = {
         ctx.spawn.tx_data().unwrap();
 
         init::LateResources {
+            radio,
+            ble_r,
+            ble_ll,
             statemachine,
             rfm_irq_pin,
             status_led,
@@ -123,7 +219,55 @@ const APP: () = {
             spim,
         }
     }
+    #[task(binds = RADIO, resources = [radio, ble_ll], spawn = [ble_worker], priority = 3)]
+    fn radio(ctx: radio::Context) {
+        let ble_ll: &mut LinkLayer<AppConfig> = ctx.resources.ble_ll;
+        if let Some(cmd) = ctx
+            .resources
+            .radio
+            .recv_interrupt(ble_ll.timer().now(), ble_ll)
+        {
+            ctx.resources.radio.configure_receiver(cmd.radio);
+            ble_ll.timer().configure_interrupt(cmd.next_update);
 
+            if cmd.queued_work {
+                // If there's any lower-priority work to be done, ensure that happens.
+                // If we fail to spawn the task, it's already scheduled.
+                ctx.spawn.ble_worker().ok();
+            }
+        }
+    }
+
+    #[task(binds = TIMER0, resources = [radio, ble_ll], spawn = [ble_worker], priority = 3)]
+    fn timer0(ctx: timer0::Context) {
+        let timer = ctx.resources.ble_ll.timer();
+        if !timer.is_interrupt_pending() {
+            return;
+        }
+        timer.clear_interrupt();
+
+        let cmd = ctx.resources.ble_ll.update_timer(ctx.resources.radio);
+        ctx.resources.radio.configure_receiver(cmd.radio);
+
+        ctx.resources
+            .ble_ll
+            .timer()
+            .configure_interrupt(cmd.next_update);
+
+        if cmd.queued_work {
+            // If there's any lower-priority work to be done, ensure that happens.
+            // If we fail to spawn the task, it's already scheduled.
+            ctx.spawn.ble_worker().ok();
+        }
+    }
+
+    #[task(resources = [ble_r], priority = 2, capacity = 10)]
+    fn ble_worker(ctx: ble_worker::Context) {
+        // Fully drain the packet queue
+        while ctx.resources.ble_r.has_work() {
+            ctx.resources.ble_r.process_one().unwrap();
+        }
+    }
     #[task(binds = RTC1, resources = [rtc1], priority=2, spawn=[])]
     fn on_rtc1(ctx: on_rtc1::Context) {
         ctx.resources.rtc1.reset_event(RtcInterrupt::Compare0);
@@ -131,6 +275,7 @@ const APP: () = {
 
         defmt::trace!("Interrupt from rtc1");
     }
+
     #[task(binds = GPIOTE, resources = [gpiote, rfm_irq_pin, switch_pin], priority=3, spawn=[handle_rfm_interrupt, handle_retry_interrupt])]
     fn on_gpiote(ctx: on_gpiote::Context) {
         if ctx.resources.gpiote.port().is_event_triggered() {
@@ -230,6 +375,7 @@ const APP: () = {
     // software tasks.
     extern "C" {
         fn I2S();
+        fn WDT();
     }
 };
 
