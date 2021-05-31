@@ -1,7 +1,6 @@
 #![no_std]
 
 pub mod rfm_statemachine;
-pub mod ble;
 //use core::sync::atomic::{AtomicUsize, Ordering};
 
 // pick a panicking behavior

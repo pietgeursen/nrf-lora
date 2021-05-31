@@ -15,7 +15,6 @@ use nrf52840_hal::{
 };
 
 use nrf_bamboo_rs as _;
-use nrf_bamboo_rs::ble::*;
 use nrf_bamboo_rs::rfm_statemachine::*;
 
 use rfm95_rs::{
@@ -41,7 +40,6 @@ const APP: () = {
 
     #[idle(resources=[])]
     fn idle(_ctx: idle::Context) -> ! {
-        configure_sd();
         loop {
             //defmt::info!("idle");
             cortex_m::asm::wfi();

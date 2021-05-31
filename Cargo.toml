@@ -16,8 +16,8 @@ cortex-m = "0.7.1"
 cortex-m-rtic = "0.5.5"
 embedded-hal = "0.2.4"
 nrf52840-hal = "0.12.1"
-#nrf-softdevice-s132 = "0.1.1"
-nrf-softdevice-s140 = "0.1.1"
+rubble = { git = "https://github.com/jonas-schievink/rubble", default-features = false }
+rubble-nrf5x = { git = "https://github.com/jonas-schievink/rubble", features = ["52840"]}
 panic-halt = "0.2.0"
 panic-probe = { version = "0.1.0"}
 rfm95-rs = { path = "../lora/rfm95c/", features = ["defmt-info"] }
