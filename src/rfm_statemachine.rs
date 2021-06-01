@@ -1,3 +1,4 @@
+use bbqueue::{Consumer, Producer, consts::*};
 use nrf52840_hal::gpio::{Output, Pin, PushPull};
 use nrf52840_hal::pac::{SPIM0, TIMER3};
 use nrf52840_hal::timer::OneShot;
@@ -31,6 +32,8 @@ pub struct Context {
     >,
     pub ppm_correction: Option<PpmCorrection>,
     pub rf_correction: Option<FrequencyRf>,
+    pub tx_consumer: Consumer<'static, U512>,
+    pub rx_producer: Producer<'static, U512>,
 }
 
 pub struct TempContext<'a> {
@@ -39,9 +42,13 @@ pub struct TempContext<'a> {
 
 statemachine! {
     *(&mut TempContext) Uninit + Initialize / initialize = Idle,
-    Idle + StartTransmitting / start_transmission = Transmitting,
-    Transmitting + TxCompleted / stop_transmitting = TxCompleted,
-    TxCompleted + StartReceiving / start_receiving = Receiving,
+    Idle + StartTransmitting [guard_start_transmitting] / start_transmitting = Transmitting,
+    Transmitting + TxCompleted / stop_transmitting = Idle,
+    Idle + StartReceiving / start_receiving = Receiving,
+    Idle + StartCad / start_cad = Cad,
+    Cad + CadCompleted / stop_cad = CadComplete,
+    CadComplete + StartReceiving / start_receiving = Receiving, 
+
     Receiving + RxCompleted [guard_stop_receiving] / stop_receiving = Idle,
 }
 
@@ -81,11 +88,22 @@ impl StateMachineContext for Context {
                 },
             )
             .unwrap();
+
+        // TODO put this in config?
+        self.rfm95
+            .set_rx_fifo_base_address(ctx.spim, 0).unwrap();
     }
-    fn start_transmission(&mut self, ctx: &mut TempContext) -> () {
-        defmt::trace!("tx_data");
+
+    fn guard_start_transmitting(&mut self, _ctx: &mut TempContext) -> bool {
+        defmt::trace!("guard start transmitting");
+        self.tx_consumer.read().is_ok()
+    }
+    fn start_transmitting(&mut self, ctx: &mut TempContext) -> () {
+        defmt::trace!("start transmitting");
         // clear the tx interrupt in the rfm95
         let mut data_to_transmit = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+        // TODO set the fifo tx pointer to the start of the address space
 
         // Switch the dio0 mapping to enable the TxDone interrupt
         self.rfm95
@@ -120,8 +138,17 @@ impl StateMachineContext for Context {
             .unwrap();
     }
 
+    fn start_cad(&mut self, ctx: &mut TempContext) -> (){
+
+    }
+
+    fn stop_cad(&mut self, ctx: &mut TempContext) -> (){
+
+    }
     fn start_receiving(&mut self, ctx: &mut TempContext) -> () {
         defmt::trace!("rx_data");
+        // TODO: set the rx pointer
+        
         // clear the tx interrupt in the rfm95
         self.rfm95
             .read_update_write_packed_struct::<_, _, { DioMapping::SIZE }>(
@@ -154,7 +181,6 @@ impl StateMachineContext for Context {
     fn stop_receiving(&mut self, ctx: &mut TempContext) -> () {
         defmt::trace!("rx_complete");
         // clear the rx interrupt in the rfm95
-
         self.rfm95
             .read_update_write_packed_struct::<_, _, { IrqFlags::SIZE }>(
                 &mut ctx.spim,
@@ -165,6 +191,18 @@ impl StateMachineContext for Context {
                 },
             )
             .unwrap();
+
+        // get the number or rx bytes
+        let fifo_address_and_size = self.rfm95.get_rx_fifo_address_and_size(&mut ctx.spim).unwrap();
+        defmt::trace!("rx_fifo_size: {:?}", fifo_address_and_size.size);
+        defmt::trace!("rx_fifo_address: {:?}", fifo_address_and_size.address);
+
+        // reserve the bytes in the queue
+        let mut grant = self.rx_producer.grant_exact(fifo_address_and_size.size as usize).expect("out of space in queue");
+        // Pass the reserved bytes in and read the rx packet.
+        self.rfm95.read_rx_fifo(&mut ctx.spim, &fifo_address_and_size, grant.buf()).unwrap();
+        // Commit the bytes in the queue
+        grant.commit(fifo_address_and_size.size as usize);
 
         let frq_err = self
             .rfm95
@@ -198,6 +236,6 @@ impl StateMachineContext for Context {
             .read_packed_struct::<IrqFlags, { IrqFlags::SIZE }>(&mut ctx.spim)
             .unwrap();
 
-        irq_flags.rx_done && !irq_flags.payload_crc_error
+        irq_flags.rx_done && !irq_flags.payload_crc_error && irq_flags.valid_header
     }
 }

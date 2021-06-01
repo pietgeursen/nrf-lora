@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use bbqueue::{BBBuffer, Producer, Consumer, ConstBBBuffer, consts::*};
 use nrf52840_hal as hal;
 use nrf52840_hal::{
     gpio::{
@@ -28,7 +29,6 @@ use rfm95_rs::{
 };
 use rtic::app;
 
-use bbqueue::Consumer;
 use core::sync::atomic::{compiler_fence, Ordering};
 use rubble::{
     config::Config,
@@ -66,6 +66,14 @@ const APP: () = {
         rfm_irq_pin: Pin<Input<PullUp>>,
         switch_pin: Pin<Input<PullUp>>,
 
+        #[init(BBBuffer(ConstBBBuffer::new()))]
+        lora_tx_queue: BBBuffer<U512>,
+        #[init(BBBuffer(ConstBBBuffer::new()))]
+        lora_rx_queue: BBBuffer<U512>,
+
+        lora_tx_producer: Producer<'static, U512>,
+        lora_rx_consumer: Consumer<'static, U512>,
+
         // Below is stuff for rubble:
         #[init([0; MIN_PDU_BUF])]
         ble_tx_buf: PacketBuffer,
@@ -90,7 +98,7 @@ const APP: () = {
         }
     }
 
-    #[init(spawn=[tx_data], resources =[ble_tx_buf, ble_rx_buf, tx_queue, rx_queue])]
+    #[init(spawn=[rx_data], resources =[ble_tx_buf, ble_rx_buf, tx_queue, rx_queue, lora_rx_queue, lora_tx_queue])]
     fn init(ctx: init::Context) -> init::LateResources {
         defmt::info!("init");
 
@@ -103,7 +111,10 @@ const APP: () = {
         // On reset, the internal high frequency clock is already used, but we
         // also need to switch to the external HF oscillator. This is needed
         // for Bluetooth to work.
-        let _clocks = hal::clocks::Clocks::new(device.CLOCK).enable_ext_hfosc();
+        let _clocks = hal::clocks::Clocks::new(device.CLOCK)
+            .enable_ext_hfosc()
+            .set_lfclk_src_rc()
+            .start_lfclk();
 
         let ble_timer = BleTimer::init(device.TIMER0);
 
@@ -117,22 +128,22 @@ const APP: () = {
             ctx.resources.ble_rx_buf,
         );
 
-        // Create TX/RX queues
-        let (tx, tx_cons) = ctx.resources.tx_queue.split();
-        let (rx_prod, rx) = ctx.resources.rx_queue.split();
+        // Feather pin D13
+        let other_status_led = p1.p1_09.into_push_pull_output(Level::Low).degrade();
 
         // Create the actual BLE stack objects
         let mut ble_ll = LinkLayer::<AppConfig>::new(device_address, ble_timer);
 
-        // Feather pin D13
-        let other_status_led = p1.p1_09.into_push_pull_output(Level::Low).degrade();
+        // Create TX/RX queues
+        let (tx, tx_cons) = ctx.resources.tx_queue.split();
+        let (rx_prod, rx) = ctx.resources.rx_queue.split();
 
         let ble_r = Responder::new(
             tx,
             rx,
-            L2CAPState::new(BleChannelMap::with_attributes(attrs::LoraMessagingAttrs::new(
-                other_status_led,
-            ))),
+            L2CAPState::new(BleChannelMap::with_attributes(
+                attrs::LoraMessagingAttrs::new(other_status_led),
+            )),
         );
 
         // Send advertisement and set up regular interrupt
@@ -192,10 +203,15 @@ const APP: () = {
         let rfm95 = RFM95::new(&mut spim, spi_cs, rfm_reset, config, delay_timer).unwrap();
 
         // Configure and create the statemachine for the rfm95
+        let (lora_tx_producer, lora_tx_consumer) = ctx.resources.lora_tx_queue.try_split().unwrap();
+        let (lora_rx_producer, lora_rx_consumer) = ctx.resources.lora_rx_queue.try_split().unwrap();
+
         let context = Context {
             rfm95,
             ppm_correction: None,
             rf_correction: None,
+            rx_producer: lora_rx_producer,
+            tx_consumer: lora_tx_consumer
         };
         let mut statemachine = StateMachine::new(context);
 
@@ -204,21 +220,24 @@ const APP: () = {
             .process_event(&mut sm_ctx, Events::Initialize)
             .unwrap();
 
-        ctx.spawn.tx_data().unwrap();
+        ctx.spawn.rx_data().unwrap();
 
         init::LateResources {
-            radio,
-            ble_r,
-            ble_ll,
+            lora_tx_producer,
+            lora_rx_consumer,
             statemachine,
             rfm_irq_pin,
             status_led,
             switch_pin,
+            ble_ll,
             gpiote,
+            radio,
+            ble_r,
             rtc1,
             spim,
         }
     }
+
     #[task(binds = RADIO, resources = [radio, ble_ll], spawn = [ble_worker], priority = 3)]
     fn radio(ctx: radio::Context) {
         let ble_ll: &mut LinkLayer<AppConfig> = ctx.resources.ble_ll;
@@ -240,6 +259,7 @@ const APP: () = {
 
     #[task(binds = TIMER0, resources = [radio, ble_ll], spawn = [ble_worker], priority = 3)]
     fn timer0(ctx: timer0::Context) {
+
         let timer = ctx.resources.ble_ll.timer();
         if !timer.is_interrupt_pending() {
             return;
@@ -268,10 +288,17 @@ const APP: () = {
             ctx.resources.ble_r.process_one().unwrap();
         }
     }
-    #[task(binds = RTC1, resources = [rtc1], priority=2, spawn=[])]
-    fn on_rtc1(ctx: on_rtc1::Context) {
+    #[task(binds = RTC1, resources = [rtc1, ble_ll], priority=2, spawn=[])]
+    fn on_rtc1(mut ctx: on_rtc1::Context) {
         ctx.resources.rtc1.reset_event(RtcInterrupt::Compare0);
         ctx.resources.rtc1.clear_counter();
+
+        ctx.resources.ble_ll.lock(|ble_ll|{
+            if !ble_ll.is_connected() && !ble_ll.is_advertising() {
+                defmt::info!("ble not connected and not advertising");
+                // For now just reset?
+            }
+        });
 
         defmt::trace!("Interrupt from rtc1");
     }
@@ -325,7 +352,7 @@ const APP: () = {
         ctx.resources
             .statemachine
             .process_event(&mut sm_ctx, Events::StartTransmitting)
-            .unwrap();
+            .ok();
     }
 
     #[task(resources=[spim, statemachine])]
@@ -353,7 +380,7 @@ const APP: () = {
         ctx.spawn.rx_data().unwrap();
     }
 
-    #[task(resources=[spim, statemachine, status_led], spawn=[tx_data])]
+    #[task(resources=[spim, statemachine, lora_rx_consumer, status_led], spawn=[tx_data])]
     fn rx_complete(ctx: rx_complete::Context) {
         let mut sm_ctx = TempContext {
             spim: ctx.resources.spim,
@@ -365,6 +392,12 @@ const APP: () = {
 
         if result.is_ok() {
             toggle_status_led(ctx.resources.status_led);
+
+            let mut grant = ctx.resources.lora_rx_consumer.split_read().unwrap();
+            grant.to_release(grant.combined_len());
+            let (buf_a, buf_b) = grant.bufs();
+            
+            defmt::info!("received lora bytes: {:?}, {:?}", buf_a, buf_b);
 
             ctx.spawn.tx_data().unwrap();
         }

@@ -12,7 +12,7 @@ members = ["testsuite"]
 arrayvec = { version = "0.7", default-features = false }
 apds9960 = "0.1.0"
 bamboo-rs-core = { path = "../choir/bamboo-rs/bamboo-rs-core", default-features=false, features = ["u32_backend"] }
-bbqueue = "0.4.1"
+bbqueue = "0.4.12"
 bmp280-rs = { path = "../bmp280" }
 cortex-m = "0.7.1"
 cortex-m-rtic = "0.5.5"
